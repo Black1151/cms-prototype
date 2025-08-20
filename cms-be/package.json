@@ -39,6 +39,7 @@
     "graphql-type-json": "^0.3.2",
     "immudb-node": "^1.1.1",
     "libphonenumber-js": "^1.12.5",
+    "next-mdx-remote": "^5.0.0",
     "passport": "^0.7.0",
     "passport-apple": "^2.0.2",
     "passport-azure-ad": "^4.3.5",

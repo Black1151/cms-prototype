@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: cms-postgres
+    environment:
+      POSTGRES_DB: cms_dev
+      POSTGRES_USER: cms_user
+      POSTGRES_PASSWORD: cms_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    networks:
+      - cms-network
+
+  # Backend Service
+  backend:
+    build:
+      context: ./cms-be
+      dockerfile: Dockerfile.dev
+    container_name: cms-backend
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_NAME: cms_dev
+      DATABASE_USERNAME: cms_user
+      DATABASE_PASSWORD: cms_password
+    volumes:
+      - ./cms-be:/app
+      - /app/node_modules
+    depends_on:
+      - postgres
+    networks:
+      - cms-network
+    restart: unless-stopped
+
+  # Frontend Service
+  frontend:
+    build:
+      context: ./cms-fe
+      dockerfile: Dockerfile.dev
+    container_name: cms-frontend
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: development
+      NEXT_PUBLIC_API_URL: http://localhost:3000
+    volumes:
+      - ./cms-fe:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - cms-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+
+networks:
+  cms-network:
+    driver: bridge

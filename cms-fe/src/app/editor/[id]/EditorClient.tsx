@@ -2,34 +2,40 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import {
-  ChakraProvider, Box, Flex, Button, Heading, List, ListItem,
-  HStack, Spacer, useToast
+  ChakraProvider, Box, Flex, Button, Heading, HStack, Spacer, useToast
 } from "@chakra-ui/react";
+import { createChakraThemeFromTokens } from "@/lib/theme/createtheme";
+import { createRegistry } from "@/components/mdx-components";
+import { MDXRemote, MDXRemoteSerializeResult } from "next-mdx-remote";
+import { getTopLevelBlocks, findNodeById, moveTopLevel, MdxJsxNode } from "@/lib/mdx/ast";
 import remarkParse from "remark-parse";
 import remarkMdx from "remark-mdx";
-import { createRegistry } from "@/components/mdx-components";
-import { getTopLevelBlocks, findNodeById, MdxJsxNode, moveTopLevel } from "@/lib/mdx/ast";
 import { stringifyAst } from "@/lib/mdx/serialize";
-import { createChakraThemeFromTokens } from "@/lib/theme/createtheme";
-import { MDXRemoteSerializeResult, MDXRemote } from "next-mdx-remote";
 import { PropertyPanel } from "@/components/PropertyPanel";
-
+import { useMutation } from "@apollo/client";
+import { MDX_COMPILE, UPDATE_LESSON } from "@/lib/graphql/documents";
 
 type Props = {
   id: string;
+  slug: string;
   mdx: string;
   tokens: any;
   overrides: Record<string, { css: any }>;
   mdxSourceInitial: MDXRemoteSerializeResult;
 };
 
-export default function EditorClient({ id, mdx: mdxInitial, tokens, overrides: overridesInitial, mdxSourceInitial }: Props) {
+export default function EditorClient({
+  id, slug, mdx: mdxInitial, tokens, overrides: overridesInitial, mdxSourceInitial
+}: Props) {
   const [mdx, setMdx] = useState(mdxInitial);
   const [mdxSource, setMdxSource] = useState<MDXRemoteSerializeResult>(mdxSourceInitial);
   const [overrides, setOverrides] = useState<Record<string, { css: any }>>(overridesInitial ?? {});
   const toast = useToast();
 
-  // Parse to AST in the client for DnD & prop editing
+  const [compileMdx] = useMutation(MDX_COMPILE);
+  const [updateLesson] = useMutation(UPDATE_LESSON);
+
+  // Parse to AST for DnD & prop editing
   const { tree, blocks } = useMemo(() => {
     const parse = require("unified").unified().use(remarkParse).use(remarkMdx);
     const t = parse.parse(mdx);
@@ -41,25 +47,20 @@ export default function EditorClient({ id, mdx: mdxInitial, tokens, overrides: o
   );
   const selectedNode = selectedId ? (findNodeById(tree, selectedId) as MdxJsxNode | null) : null;
 
-  // Debounced server compile for live preview
+  // Debounced GraphQL compile for live preview
   useEffect(() => {
-    const controller = new AbortController();
     const t = setTimeout(async () => {
       try {
-        const res = await fetch("/api/mdx/preview", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mdx }),
-          signal: controller.signal,
-        });
-        const json = await res.json();
-        if (res.ok) setMdxSource(json.mdxSource);
+        const { data } = await compileMdx({ variables: { mdx } });
+        if (data?.compileMdx?.compiledSource) {
+          setMdxSource({ compiledSource: data.compileMdx.compiledSource, scope: {} } as any);
+        }
       } catch {
-        /* ignore typing interruptions */
+        // ignore transient typing errors
       }
     }, 300);
-    return () => { clearTimeout(t); controller.abort(); };
-  }, [mdx]);
+    return () => clearTimeout(t);
+  }, [mdx, compileMdx]);
 
   async function reorder(from: number, to: number) {
     moveTopLevel(tree, from, to);
@@ -78,22 +79,19 @@ export default function EditorClient({ id, mdx: mdxInitial, tokens, overrides: o
     try {
       const parsed = JSON.parse(raw);
       setOverrides(prev => ({ ...prev, [id]: { css: parsed } }));
-    } catch {
-      // keep typing; JSON might be incomplete
-    }
+    } catch { /* JSON mid-typing */ }
   }
 
   async function save() {
     try {
-      const res = await fetch(`/api/lessons/${id}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mdx, overrides })
+      const { data } = await updateLesson({
+        variables: {
+          input: { slug, mdx, overrides }
+        }
       });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "Save failed");
-      setMdx(json.mdx);
-      setOverrides(json.overrides ?? {});
+      // server returns normalized mdx & cleaned overrides
+      if (data?.updateLesson?.mdx) setMdx(data.updateLesson.mdx);
+      if (data?.updateLesson?.overrides) setOverrides(data.updateLesson.overrides);
       toast({ title: "Saved", status: "success" });
     } catch (e: any) {
       toast({ title: "Error", description: e.message, status: "error", duration: 6000 });
@@ -105,7 +103,7 @@ export default function EditorClient({ id, mdx: mdxInitial, tokens, overrides: o
 
   return (
     <Flex h="100vh" overflow="hidden">
-      {/* Left: block list (swap to Atlaskit DnD when ready) */}
+      {/* Left column: block list (ready for Atlaskit DnD wiring) */}
       <Box p={4} w="320px" borderRight="1px solid" borderColor="gray.200" overflowY="auto">
         <HStack mb={3}>
           <Heading size="sm">Blocks</Heading>
