@@ -1,4 +1,5 @@
 import { Field, InputType } from '@nestjs/graphql';
+import { GraphQLJSON } from 'graphql-type-json';
 
 @InputType()
 export class UpdateLessonInput {
@@ -14,6 +15,6 @@ export class UpdateLessonInput {
   @Field(() => String)
   mdx!: string;
 
-  @Field(() => Object, { nullable: true })
+  @Field(() => GraphQLJSON, { nullable: true })
   overrides?: Record<string, { css: Record<string, any> }>;
 }

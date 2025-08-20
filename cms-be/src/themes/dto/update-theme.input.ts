@@ -1,4 +1,5 @@
 import { Field, InputType } from '@nestjs/graphql';
+import { GraphQLJSON } from 'graphql-type-json';
 
 @InputType()
 export class UpdateThemeInput {
@@ -14,6 +15,6 @@ export class UpdateThemeInput {
   @Field(() => String, { nullable: true })
   notes?: string;
 
-  @Field(() => Object)
+  @Field(() => GraphQLJSON)
   tokens!: Record<string, any>;
 }

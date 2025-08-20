@@ -1,8 +1,13 @@
 import { db } from "@/lib/db";
-import { normalizeAndValidate } from "@/lib/mdx/serialize";
+import { serverGraphQL } from "@/lib/graphql/serverFetch";
 import { OverrideSchema } from "@/lib/schemas";
 import { NextRequest, NextResponse } from "next/server";
 
+const NORMALIZE_MDX_Q = `
+  query NormalizeMdx($mdx: String!) {
+    normalizeMdx(mdx: $mdx) { normalized }
+  }
+`;
 
 export async function GET(_req: NextRequest, { params }: { params: { id: string } }) {
   const lesson = db.getLesson(params.id);
@@ -14,7 +19,18 @@ export async function PUT(req: NextRequest, { params }: { params: { id: string }
   try {
     const body = await req.json();
     const { mdx, overrides } = body ?? {};
-    const { mdx: normalized } = await normalizeAndValidate(String(mdx));
+    
+    // Use backend GraphQL resolver for MDX normalization
+    const result = await serverGraphQL<{ normalizeMdx: { normalized: string } }>(
+      NORMALIZE_MDX_Q,
+      { mdx: String(mdx) }
+    );
+    
+    if (!result?.normalizeMdx) {
+      throw new Error("Failed to normalize MDX");
+    }
+    
+    const normalized = result.normalizeMdx.normalized;
 
     const cleanOverrides: Record<string, any> = {};
     if (overrides && typeof overrides === "object") {

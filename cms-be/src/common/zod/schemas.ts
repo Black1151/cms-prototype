@@ -40,5 +40,5 @@ export const COMPONENT_SCHEMAS: Record<string, z.ZodTypeAny> = {
 };
 
 export const OverrideSchema = z.object({
-  css: z.record(z.any()),
+  css: z.record(z.string(), z.any()),
 });

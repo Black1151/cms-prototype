@@ -1,5 +1,6 @@
 import { Field, ObjectType, ID } from '@nestjs/graphql';
 import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
+import { GraphQLJSON } from 'graphql-type-json';
 
 @ObjectType()
 @Entity({ name: 'lessons' })
@@ -24,7 +25,7 @@ export class Lesson {
   @Column({ type: 'text' })
   mdx!: string;
 
-  @Field(() => Object, { nullable: true })
+  @Field(() => GraphQLJSON, { nullable: true })
   @Column({ type: 'jsonb', nullable: true })
   overrides?: Record<string, { css: Record<string, any> }>;
 }

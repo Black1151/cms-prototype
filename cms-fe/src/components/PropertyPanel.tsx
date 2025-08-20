@@ -2,7 +2,27 @@
 
 import React, { useMemo } from "react";
 import { Box, Heading, Select, Input, Textarea, FormControl, FormLabel } from "@chakra-ui/react";
-import { MdxJsxNode, getAttr, setAttr } from "../lib/mdx/ast";
+// MDX AST manipulation utilities (moved inline since backend handles processing)
+type MdxJsxNode = {
+  type: "mdxJsxFlowElement" | "mdxJsxTextElement";
+  name: string;
+  attributes: { type: "mdxJsxAttribute"; name: string; value?: any }[];
+  children?: any[];
+};
+
+function getAttr(node: MdxJsxNode, name: string) {
+  const a = node.attributes?.find((x) => x.name === name);
+  return a?.value;
+}
+
+function setAttr(node: MdxJsxNode, name: string, value: any) {
+  const idx = node.attributes?.findIndex((x) => x.name === name) ?? -1;
+  if (idx >= 0) node.attributes[idx].value = value;
+  else {
+    node.attributes = node.attributes || [];
+    node.attributes.push({ type: "mdxJsxAttribute", name, value });
+  }
+}
 
 type PanelProps = {
   node: MdxJsxNode | null;

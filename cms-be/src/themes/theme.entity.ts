@@ -1,5 +1,6 @@
 import { Field, ObjectType, ID } from '@nestjs/graphql';
 import { Column, Entity, PrimaryColumn } from 'typeorm';
+import { GraphQLJSON } from 'graphql-type-json';
 
 @ObjectType()
 @Entity({ name: 'themes' })
@@ -17,7 +18,7 @@ export class Theme {
   @Field(() => String, { nullable: true })
   notes?: string;
 
-  @Field(() => Object)
+  @Field(() => GraphQLJSON)
   @Column({ type: 'jsonb' })
   tokens!: Record<string, any>;
 }

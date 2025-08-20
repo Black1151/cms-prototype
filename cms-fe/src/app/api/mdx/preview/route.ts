@@ -1,18 +1,33 @@
 import { NextRequest, NextResponse } from "next/server";
+import { serverGraphQL } from "@/lib/graphql/serverFetch";
 
-import { serialize } from "next-mdx-remote/serialize";
-import remarkParse from "remark-parse";
-import remarkMdx from "remark-mdx";
-import { normalizeAndValidate } from "@/lib/mdx/serialize";
+const COMPILE_MDX_Q = `
+  query CompileMdx($mdx: String!) {
+    compileMdx(mdx: $mdx) { 
+      normalized 
+      compiledSource 
+    }
+  }
+`;
 
 export async function POST(req: NextRequest) {
   try {
     const { mdx } = (await req.json()) as { mdx: string };
-    const { mdx: normalized } = await normalizeAndValidate(mdx);
-    const mdxSource = await serialize(normalized, {
-      mdxOptions: { remarkPlugins: [remarkParse as any, remarkMdx as any], rehypePlugins: [] },
+    
+    // Use backend GraphQL resolver for MDX processing
+    const result = await serverGraphQL<{ compileMdx: { normalized: string; compiledSource: string } }>(
+      COMPILE_MDX_Q,
+      { mdx }
+    );
+    
+    if (!result?.compileMdx) {
+      throw new Error("Failed to compile MDX");
+    }
+    
+    return NextResponse.json({ 
+      mdx: result.compileMdx.normalized, 
+      mdxSource: { compiledSource: result.compileMdx.compiledSource, scope: {} }
     });
-    return NextResponse.json({ mdx: normalized, mdxSource });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? "MDX preview failed" }, { status: 400 });
   }

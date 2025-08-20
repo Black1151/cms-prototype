@@ -3,8 +3,8 @@
 import { ChakraProvider, Box } from "@chakra-ui/react";
 import type { MDXRemoteSerializeResult } from "next-mdx-remote";
 import { MDXRemote } from "next-mdx-remote";
-import { createChakraThemeFromTokens } from "../../../src/lib/theme/createTheme";
-import { createRegistry } from "../../../src/components/mdx-components";
+import { createChakraThemeFromTokens } from "@/lib/theme/createtheme";
+import { createRegistry } from "@/components/mdx-components";
 
 type Props = {
   id: string;

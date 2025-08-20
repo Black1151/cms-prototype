@@ -39,4 +39,4 @@ export const COMPONENT_SCHEMAS: Record<string, z.ZodTypeAny> = {
   TwoColumn: TwoColumnProps,
 };
 
-export const OverrideSchema = z.object({ css: z.record(z.any()) });
+export const OverrideSchema = z.object({ css: z.record(z.string(), z.any()) });

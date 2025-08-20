@@ -5,7 +5,6 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { join } from 'path';
 import { ThemesModule } from './themes/theme.module';
 import { LessonsModule } from './lessons/lesson.module';
-import { JsonScalar } from './common/scalars/json.scalar';
 import { SeedService } from './seed/seed.service';
 import { Theme } from './themes/theme.entity';
 import { Lesson } from './lessons/lesson.entity';
@@ -20,17 +19,18 @@ import { Lesson } from './lessons/lesson.entity';
     }),
     TypeOrmModule.forRoot({
       type: 'postgres',
-      host: process.env.DB_HOST ?? 'localhost',
-      port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 5432,
-      username: process.env.DB_USER ?? 'postgres',
-      password: process.env.DB_PASS ?? 'postgres',
-      database: process.env.DB_NAME ?? 'insight',
+      host: process.env.DATABASE_HOST ?? 'localhost',
+      port: process.env.DATABASE_PORT ? Number(process.env.DATABASE_PORT) : 5432,
+      username: process.env.DATABASE_USERNAME ?? 'postgres',
+      password: process.env.DATABASE_PASSWORD ?? 'postgres',
+      database: process.env.DATABASE_NAME ?? 'cms_dev',
       entities: [Theme, Lesson],
       synchronize: true, // dev only
     }),
+    TypeOrmModule.forFeature([Theme, Lesson]),
     ThemesModule,
     LessonsModule,
   ],
-  providers: [JsonScalar, SeedService],
+  providers: [SeedService],
 })
 export class AppModule {}
