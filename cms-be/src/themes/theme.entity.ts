@@ -10,12 +10,15 @@ export class Theme {
   id!: string; // e.g., "biology-v1"
 
   @Field(() => String, { nullable: true })
+  @Column({ type: 'text', nullable: true })
   name?: string;
 
   @Field(() => String, { nullable: true })
+  @Column({ type: 'text', nullable: true })
   basedOnThemeId?: string;
 
   @Field(() => String, { nullable: true })
+  @Column({ type: 'text', nullable: true })
   notes?: string;
 
   @Field(() => GraphQLJSON)

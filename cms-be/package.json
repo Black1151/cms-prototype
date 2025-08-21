@@ -40,6 +40,7 @@
     "immudb-node": "^1.1.1",
     "libphonenumber-js": "^1.12.5",
     "next-mdx-remote": "^5.0.0",
+    "openai": "^5.13.1",
     "passport": "^0.7.0",
     "passport-apple": "^2.0.2",
     "passport-azure-ad": "^4.3.5",
@@ -61,7 +62,7 @@
     "typeorm": "^0.3.21",
     "unist-util-visit": "^5.0.0",
     "uuid": "^11.1.0",
-    "zod": "^4.0.17"
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.2.0",

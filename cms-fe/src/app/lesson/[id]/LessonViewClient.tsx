@@ -1,6 +1,6 @@
 "use client";
 
-import { ChakraProvider, Box } from "@chakra-ui/react";
+import { ChakraProvider, Box, Container } from "@chakra-ui/react";
 import type { MDXRemoteSerializeResult } from "next-mdx-remote";
 import { MDXRemote } from "next-mdx-remote";
 import { createChakraThemeFromTokens } from "@/lib/theme/createtheme";
@@ -21,10 +21,10 @@ export default function LessonViewClient({ id, mdxSource, tokens, overrides }: P
   return (
     <Box p={6} id={rootId}>
       {/* Scoped provider: theme variables apply only under #lesson-ID */}
-      <ChakraProvider theme={theme} cssVarsRoot={`#${rootId}`}>
-        <Box maxW="840px" mx="auto">
+      <ChakraProvider theme={theme} cssVarsRoot={`#${rootId}`} resetCSS={false}>
+        <Container maxW="840px" mx="auto">
           <MDXRemote {...mdxSource} components={components as any} />
-        </Box>
+        </Container>
       </ChakraProvider>
     </Box>
   );

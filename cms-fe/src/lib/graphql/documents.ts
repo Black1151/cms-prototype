@@ -7,9 +7,32 @@ export const GET_THEME = gql`
   }
 `;
 
+export const GET_THEMES = gql`
+  query GetThemes {
+    themes { id name notes tokens }
+  }
+`;
+
 export const UPDATE_THEME = gql`
   mutation UpdateTheme($input: UpdateThemeInput!) {
-    updateTheme(input: $input) { id name tokens }
+    updateTheme(input: $input) { id name tokens notes }
+  }
+`;
+
+export const GENERATE_THEME = gql`
+  mutation GenerateTheme($input: GenerateThemeInput!) {
+    generateTheme(input: $input) {
+      id
+      name
+      tokens
+      notes
+    }
+  }
+`;
+
+export const DELETE_THEME = gql`
+  mutation DeleteTheme($id: String!) {
+    deleteTheme(id: $id)
   }
 `;
 

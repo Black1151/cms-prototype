@@ -2,7 +2,7 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import {
-  ChakraProvider, Box, Flex, Button, Heading, HStack, Spacer, useToast
+  ChakraProvider, Box, Flex, Button, Heading, HStack, Spacer, useToast, VStack, Text, IconButton, Badge
 } from "@chakra-ui/react";
 import { createChakraThemeFromTokens } from "@/lib/theme/createtheme";
 import { createRegistry } from "@/components/mdx-components";
@@ -100,20 +100,22 @@ export default function EditorClient({
     const t = setTimeout(async () => {
       try {
         const { data } = await compileMdx({ variables: { mdx } });
-        if (data?.compileMdx?.compiledSource) {
-          setMdxSource({ compiledSource: data.compileMdx.compiledSource, scope: {} } as any);
+        if (data?.compileMdx) {
+          setMdxSource({
+            compiledSource: data.compileMdx.compiledSource,
+            scope: {}
+          } as any);
         }
-      } catch {
-        // ignore transient typing errors
+      } catch (e) {
+        console.error("MDX compilation failed:", e);
       }
-    }, 300);
+    }, 500);
     return () => clearTimeout(t);
   }, [mdx, compileMdx]);
 
-  async function reorder(from: number, to: number) {
-    moveTopLevel(tree, from, to);
-    // For now, just update the MDX state - backend will handle actual serialization
-    setMdx(mdx); // Placeholder - would need backend call for proper serialization
+  function reorder(fromIndex: number, toIndex: number) {
+    moveTopLevel(tree, fromIndex, toIndex);
+    // Would need backend call to serialize updated tree
   }
 
   async function mutateSelected(mut: (n: MdxJsxNode) => void) {
@@ -160,43 +162,54 @@ export default function EditorClient({
           <Button size="sm" onClick={save} colorScheme="green">Save</Button>
         </HStack>
 
-        <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+        <VStack spacing={2} align="stretch">
           {blocks.map((b: any, idx: number) => {
             const idAttr = b.attributes.find((a: any) => a.name === "data-id")?.value ?? "(no-id)";
             const name = b.name;
             return (
-              <li key={idAttr} style={{ marginBottom: 8 }}>
-                <div
-                  onClick={() => setSelectedId(idAttr)}
-                  style={{
-                    padding: 8,
-                    border: "1px solid",
-                    borderColor: selectedId === idAttr ? "#22c55e" : "#e2e8f0",
-                    borderRadius: 6,
-                    cursor: "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8
-                  }}
-                >
-                  <span style={{ fontSize: 12, background: "#f8fafc", padding: "2px 6px", borderRadius: 4 }}>{name}</span>
-                  <span style={{ fontSize: 12, color: "#64748b" }}>{idAttr}</span>
-                  <span style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
-                    {/* Replace with Atlaskit drag handles later */}
-                    <button onClick={(e) => { e.stopPropagation(); if (idx>0) reorder(idx, idx-1); }}>↑</button>
-                    <button onClick={(e) => { e.stopPropagation(); if (idx<blocks.length-1) reorder(idx, idx+1); }}>↓</button>
-                  </span>
-                </div>
-              </li>
+              <Box
+                key={idAttr}
+                onClick={() => setSelectedId(idAttr)}
+                p={2}
+                border="1px solid"
+                borderColor={selectedId === idAttr ? "green.500" : "gray.200"}
+                borderRadius="md"
+                cursor="pointer"
+                display="flex"
+                alignItems="center"
+                gap={2}
+                _hover={{ borderColor: "gray.300" }}
+              >
+                <Badge size="sm" variant="subtle" colorScheme="gray">{name}</Badge>
+                <Text fontSize="xs" color="gray.500">{idAttr}</Text>
+                <Spacer />
+                <HStack spacing={1}>
+                  {/* Replace with Atlaskit drag handles later */}
+                  <IconButton
+                    size="xs"
+                    aria-label="Move up"
+                    icon={<Text>↑</Text>}
+                    onClick={(e) => { e.stopPropagation(); if (idx>0) reorder(idx, idx-1); }}
+                    variant="ghost"
+                  />
+                  <IconButton
+                    size="xs"
+                    aria-label="Move down"
+                    icon={<Text>↓</Text>}
+                    onClick={(e) => { e.stopPropagation(); if (idx<blocks.length-1) reorder(idx, idx+1); }}
+                    variant="ghost"
+                  />
+                </HStack>
+              </Box>
             );
           })}
-        </ul>
+        </VStack>
       </Box>
 
       {/* Right: preview + property panel */}
       <Flex flex="1" overflow="hidden">
         <Box flex="1" p={6} overflowY="auto" id={`lesson-edit-${id}`}>
-          <ChakraProvider theme={theme} cssVarsRoot={`#${`lesson-edit-${id}`}`}>
+          <ChakraProvider theme={theme} cssVarsRoot={`#${`lesson-edit-${id}`}`} resetCSS={false}>
             <Box maxW="840px" mx="auto">
               <MDXRemote {...mdxSource} components={components as any} />
             </Box>
