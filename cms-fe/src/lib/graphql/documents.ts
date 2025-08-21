@@ -36,6 +36,19 @@ export const DELETE_THEME = gql`
   }
 `;
 
+export const AMEND_THEME = gql`
+  mutation AmendTheme($input: AmendThemeInput!) {
+    amendTheme(input: $input) {
+      id
+      name
+      tokens
+      notes
+      _preview
+      diff
+    }
+  }
+`;
+
 /** Lessons */
 export const GET_LESSON = gql`
   query GetLesson($slug: String!) {

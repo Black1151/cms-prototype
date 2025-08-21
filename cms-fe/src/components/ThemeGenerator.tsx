@@ -2,7 +2,7 @@
 
 import React, { useState } from 'react';
 import { useMutation, useQuery } from '@apollo/client';
-import { GENERATE_THEME, UPDATE_THEME, GET_THEMES, DELETE_THEME } from '@/lib/graphql/documents';
+import { GENERATE_THEME, UPDATE_THEME, GET_THEMES, DELETE_THEME, AMEND_THEME } from '@/lib/graphql/documents';
 import { ThemeTokens } from '@/lib/schemas';
 import { z } from 'zod';
 import {
@@ -63,6 +63,10 @@ export default function ThemeGenerator() {
   const [selectedThemeId, setSelectedThemeId] = useState<string>('');
   const [themeName, setThemeName] = useState<string>('');
   const [themeToDelete, setThemeToDelete] = useState<{ id: string; name: string } | null>(null);
+  const [amendmentInstruction, setAmendmentInstruction] = useState('');
+  const [amendmentScope, setAmendmentScope] = useState<Array<'notifications' | 'spacing' | 'radii' | 'brandColors' | 'accentColors' | 'typography' | 'layout' | 'shadows' | 'borders' | 'animations'>>([]);
+  const [amendmentMode, setAmendmentMode] = useState<'auto' | 'regen' | 'patch'>('auto');
+  const [isPreviewMode, setIsPreviewMode] = useState(false);
   const { isOpen: isDeleteModalOpen, onOpen: onDeleteModalOpen, onClose: onDeleteModalClose } = useDisclosure();
   const toast = useToast();
 
@@ -129,6 +133,46 @@ export default function ThemeGenerator() {
     },
   });
 
+  const [amendTheme, { loading: amending }] = useMutation(AMEND_THEME, {
+    onCompleted: (data) => {
+      if (data.amendTheme._preview) {
+        // This is a preview - show the diff
+        setGeneratedTheme(data.amendTheme);
+        setIsPreviewMode(true);
+        toast({
+          title: 'Preview Generated!',
+          description: 'Review the changes below. Click "Apply Changes" to save them.',
+          status: 'info',
+          duration: 5000,
+          isClosable: true,
+        });
+      } else {
+        // This is the actual amendment
+        setGeneratedTheme(data.amendTheme);
+        setIsPreviewMode(false);
+        setAmendmentInstruction('');
+        toast({
+          title: 'Theme Amended Successfully!',
+          description: 'Your theme has been updated with the new changes.',
+          status: 'success',
+          duration: 5000,
+          isClosable: true,
+        });
+        // Refetch themes to show updated version
+        refetchThemes();
+      }
+    },
+    onError: (err) => {
+      toast({
+        title: 'Amendment Failed',
+        description: err.message,
+        status: 'error',
+        duration: 5000,
+        isClosable: true,
+      });
+    },
+  });
+
   const handleLoadTheme = () => {
     if (!selectedThemeId) return;
     
@@ -145,6 +189,11 @@ export default function ThemeGenerator() {
       // Don't clear description - keep it for reference when switching themes
       // Don't reset saved theme ID - allow seamless theme switching
       setSelectedThemeId('');
+      
+      // Reset amendment state when loading a new theme
+      setAmendmentInstruction('');
+      setAmendmentMode('auto');
+      setIsPreviewMode(false);
       
       toast({
         title: 'Theme Loaded!',
@@ -169,6 +218,11 @@ export default function ThemeGenerator() {
       ? `${description.trim().substring(0, 30)}...`
       : description.trim();
     setThemeName(suggestedName);
+    
+    // Reset amendment state when generating new theme
+    setAmendmentInstruction('');
+    setAmendmentMode('auto');
+    setIsPreviewMode(false);
 
     try {
       await generateTheme({
@@ -236,6 +290,46 @@ export default function ThemeGenerator() {
       });
     } catch {
       // Error is handled by onError callback in the mutation
+    }
+  };
+
+  const handlePreviewAmendment = async () => {
+    if (!generatedTheme || !amendmentInstruction.trim()) return;
+    
+    try {
+      await amendTheme({
+        variables: {
+          input: {
+            id: generatedTheme.id,
+            instruction: amendmentInstruction.trim(),
+            scope: undefined, // Let AI auto-detect
+            mode: amendmentMode,
+            dryRun: true
+          }
+        }
+      });
+    } catch {
+      // Error is handled by onError callback
+    }
+  };
+
+  const handleApplyAmendment = async () => {
+    if (!generatedTheme || !amendmentInstruction.trim()) return;
+    
+    try {
+      await amendTheme({
+        variables: {
+          input: {
+            id: generatedTheme.id,
+            instruction: amendmentInstruction.trim(),
+            scope: undefined, // Let AI auto-detect
+            mode: amendmentMode,
+            dryRun: false
+          }
+        }
+      });
+    } catch {
+      // Error is handled by onError callback
     }
   };
 
@@ -418,6 +512,100 @@ export default function ThemeGenerator() {
         {/* Generated Theme Display */}
         {generatedTheme && (
           <VStack spacing={6} align="stretch">
+            {/* Theme Amendment Section */}
+            <Box p={4} bg="green.50" borderRadius="md" border="1px" borderColor="green.200">
+              <Heading as="h4" size="md" mb={4} color="green.800">
+                🎨 Amend Theme
+              </Heading>
+              <Text fontSize="sm" color="green.700" mb={4}>
+                Make follow-up adjustments to your theme without regenerating everything.
+              </Text>
+              
+              <VStack spacing={4} align="stretch">
+                <FormControl>
+                  <FormLabel fontSize="sm" fontWeight="medium">
+                    Amendment Instruction
+                  </FormLabel>
+                  <Textarea
+                    value={amendmentInstruction}
+                    onChange={(e) => setAmendmentInstruction(e.target.value)}
+                    placeholder="e.g., 'deeper colors for notifications', 'increase spacing slightly', 'make brand colors warmer'..."
+                    size="md"
+                    rows={2}
+                  />
+                </FormControl>
+
+                {/* Show detected sections */}
+                {amendmentInstruction.trim() && (
+                  <Box p={3} bg="blue.50" borderRadius="md" border="1px" borderColor="blue.200">
+                    <Text fontSize="sm" color="blue.700" fontWeight="medium">
+                      🔍 Detected sections to modify:
+                    </Text>
+                    <Text fontSize="sm" color="blue.600" mt={1}>
+                      {amendmentInstruction.trim().length > 0 ? 'Analyzing your instruction...' : 'Enter an instruction to see detected sections'}
+                    </Text>
+                  </Box>
+                )}
+
+                <FormControl>
+                  <FormLabel fontSize="sm" fontWeight="medium">
+                    Approach (optional)
+                  </FormLabel>
+                  <Select
+                    value={amendmentMode}
+                    onChange={(e) => setAmendmentMode(e.target.value as any)}
+                    size="sm"
+                  >
+                    <option value="auto">Auto-detect (recommended)</option>
+                    <option value="regen">Regenerate specific area</option>
+                    <option value="patch">Modify existing theme</option>
+                  </Select>
+                  <Text fontSize="xs" color="gray.600" mt={1}>
+                    We'll automatically detect which parts of your theme need to be changed based on your instruction.
+                  </Text>
+                </FormControl>
+
+                <HStack spacing={3}>
+                  <Button
+                    onClick={handlePreviewAmendment}
+                    disabled={!amendmentInstruction.trim() || amending}
+                    colorScheme="blue"
+                    size="md"
+                    isLoading={amending}
+                    loadingText="Previewing..."
+                    variant="outline"
+                  >
+                    Preview Changes
+                  </Button>
+                  
+                  {isPreviewMode && (
+                    <Button
+                      onClick={handleApplyAmendment}
+                      disabled={!amendmentInstruction.trim() || amending}
+                      colorScheme="green"
+                      size="md"
+                      isLoading={amending}
+                      loadingText="Applying..."
+                    >
+                      Apply Changes
+                    </Button>
+                  )}
+                </HStack>
+
+                {isPreviewMode && (
+                  <Alert status="info" borderRadius="md">
+                    <AlertIcon />
+                    <Box>
+                      <AlertTitle>Preview Mode</AlertTitle>
+                      <AlertDescription>
+                        This is a preview of your changes. Click "Apply Changes" to save them permanently.
+                      </AlertDescription>
+                    </Box>
+                  </Alert>
+                )}
+              </VStack>
+            </Box>
+
             <Box>
               <Heading as="h3" size="lg" mb={4} color="gray.800">
                 Theme Preview: {generatedTheme.name}

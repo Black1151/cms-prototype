@@ -3,6 +3,7 @@ import { Theme } from './theme.entity';
 import { ThemeService } from './theme.service';
 import { UpdateThemeInput } from './dto/update-theme.input';
 import { GenerateThemeInput } from './dto/generate-theme.input';
+import { AmendThemeInput } from './dto/amend-theme.input';
 
 @Resolver(() => Theme)
 export class ThemeResolver {
@@ -31,5 +32,10 @@ export class ThemeResolver {
   @Mutation(() => String)
   deleteTheme(@Args('id', { type: () => String }) id: string) {
     return this.service.deleteTheme(id);
+  }
+
+  @Mutation(() => Theme)
+  amendTheme(@Args('input') input: AmendThemeInput) {
+    return this.service.amend(input);
   }
 }
