@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Theme } from './theme.entity';
@@ -7,24 +7,59 @@ import { GenerateThemeInput } from './dto/generate-theme.input';
 import { AmendThemeInput } from './dto/amend-theme.input';
 import { ThemeTokensSchema } from '../common/zod/schemas';
 import { AuditService } from '../audit/audit.service';
-import { jsonPatchSchema } from '../common/jsonPatchSchema';
 import OpenAI from 'openai';
 import * as jsonpatch from 'fast-json-patch';
+import type { Operation } from 'fast-json-patch';
+
+// Deterministic NL -> ops + patcher
+import { parseInstructions } from './instruction-parser';
+import { applyParsedOps } from './logic-patcher';
+
+type AIJsonPatchOp =
+  | { op: 'replace'; path: string; value: any }
+  | { op: 'add'; path: string; value: any }
+  | { op: 'remove'; path: string };
 
 @Injectable()
 export class ThemeService {
   private openai: OpenAI;
   private amendmentCache = new Map<string, { tokens: any; diff: any; timestamp: number }>();
 
+  // ====== Model selection / knobs (env overrides) ======
+  private readonly GENERATE_MODEL = process.env.OPENAI_MODEL_THEME_GENERATE || 'gpt-5-mini';
+  private readonly PATCH_MODEL    = process.env.OPENAI_MODEL_THEME_PATCH    || 'gpt-5-nano';
+  private readonly TIMEOUT_MS     = Number(process.env.OPENAI_TIMEOUT_MS || 120000);
+  private readonly MAX_TOKENS_GEN = Number(process.env.OPENAI_MAX_TOKENS_GEN || 10000);
+  private readonly MAX_TOKENS_PAT = Number(process.env.OPENAI_MAX_TOKENS_PAT || 10000);
+
   constructor(
     @InjectRepository(Theme) private readonly repo: Repository<Theme>,
     private readonly audit: AuditService,
   ) {
+    console.log('🔧 [THEME_SERVICE] Initializing with configuration:');
+    console.log('🔧 [THEME_SERVICE] - Generate model:', this.GENERATE_MODEL);
+    console.log('🔧 [THEME_SERVICE] - Patch model:', this.PATCH_MODEL);
+    console.log('🔧 [THEME_SERVICE] - Timeout:', this.TIMEOUT_MS, 'ms');
+    console.log('🔧 [THEME_SERVICE] - Max tokens (gen):', this.MAX_TOKENS_GEN);
+    console.log('🔧 [THEME_SERVICE] - Max tokens (patch):', this.MAX_TOKENS_PAT);
+    console.log('🔧 [THEME_SERVICE] - OpenAI API key configured:', !!process.env.OPENAI_API_KEY);
+    
+    // Debug environment variables
+    console.log('🔧 [THEME_SERVICE] Environment variables:');
+    console.log('🔧 [THEME_SERVICE] - OPENAI_MODEL_THEME_GENERATE:', process.env.OPENAI_MODEL_THEME_GENERATE || 'NOT_SET (using default: gpt-5-mini)');
+    console.log('🔧 [THEME_SERVICE] - OPENAI_TIMEOUT_MS:', process.env.OPENAI_TIMEOUT_MS || 'NOT_SET (using default: 20000)');
+    console.log('🔧 [THEME_SERVICE] - OPENAI_MAX_TOKENS_GEN:', process.env.OPENAI_MAX_TOKENS_GEN || 'NOT_SET (using default: 10000)');
+    console.log('🔧 [THEME_SERVICE] - OPENAI_API_KEY length:', process.env.OPENAI_API_KEY ? `${process.env.OPENAI_API_KEY.length} chars` : 'NOT_SET');
+    
     this.openai = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY,
     });
+    console.log('🔧 [THEME_SERVICE] OpenAI client initialized');
   }
 
+  // ======================================================
+  // ================ Basic repository ops ================
+  // ======================================================
   async get(id: string) {
     const t = await this.repo.findOne({ where: { id } });
     if (!t) throw new NotFoundException('Theme not found');
@@ -32,306 +67,121 @@ export class ThemeService {
   }
 
   async getAll() {
-    try {
-      const themes = await this.repo.find({
-        select: ['id', 'name', 'notes', 'tokens'],
-        order: { name: 'ASC' }
-      });
-      return themes;
-    } catch (error) {
-      throw error;
-    }
+    const themes = await this.repo.find({
+      select: ['id', 'name', 'notes', 'tokens'],
+      order: { name: 'ASC' }
+    });
+    return themes;
   }
 
   async upsert(input: UpdateThemeInput) {
-    // validate tokens with Zod
     const tokens = ThemeTokensSchema.parse(input.tokens);
-    
-    // Ensure name is not null/undefined
     if (!input.name || input.name.trim() === '') {
       input.name = input.id;
     }
-    
     const next = this.repo.create({ ...input, tokens });
     const saved = await this.repo.save(next);
-    
     await this.audit.log('theme.upsert', { id: input.id });
     return saved;
   }
 
+  // ======================================================
+  // =================== Theme generation =================
+  // ======================================================
+  
+  // Add health check method for debugging
+  async checkOpenAIConnection() {
+    console.log('🏥 [HEALTH] Checking OpenAI connection...');
+    try {
+      const startTime = Date.now();
+      const response = await this.openai.models.list();
+      const duration = Date.now() - startTime;
+      console.log('✅ [HEALTH] OpenAI connection successful in', duration, 'ms');
+      console.log('✅ [HEALTH] Available models:', response.data.length);
+      return { success: true, duration, modelCount: response.data.length };
+    } catch (error: any) {
+      console.error('❌ [HEALTH] OpenAI connection failed:', error.message);
+      return { success: false, error: error.message };
+    }
+  }
 
   async generateTheme(input: GenerateThemeInput) {
+    console.log('🚀 [THEME_GEN] Starting theme generation...');
+    console.log('📝 [THEME_GEN] Description:', input.description);
+    console.log('⏰ [THEME_GEN] Timeout setting:', this.TIMEOUT_MS, 'ms');
+    console.log('🔑 [THEME_GEN] API key configured:', !!process.env.OPENAI_API_KEY);
+    console.log('🤖 [THEME_GEN] Using model:', this.GENERATE_MODEL);
+    
     if (!process.env.OPENAI_API_KEY) {
+      console.error('❌ [THEME_GEN] No OpenAI API key configured');
       throw new Error('OpenAI API key not configured');
     }
-  
-    const model = 'gpt-5-nano'; // or process.env.OPENAI_MODEL
-  
-    const prompt = `You are an expert UI designer and CSS specialist. Given a description of a theme, create a comprehensive design system with all conceivable styling options. The theme description is: "${input.description}". Only output valid JSON.
 
-Create a complete, unique theme that matches the description. Use the following structure as a guide, but generate CREATIVE and ORIGINAL values that fit the theme description:
+    const startTime = Date.now();
+    console.log('📋 [THEME_GEN] Building prompt...');
+    const prompt = this.buildThemeGenerationPrompt(input.description);
+    console.log('📋 [THEME_GEN] Prompt built, length:', prompt.length, 'chars');
 
-{
-  "colors": {
-    "brand": {
-      "50": "#[generate unique hex color]",
-      "100": "#[generate unique hex color]", 
-      "200": "#[generate unique hex color]",
-      "300": "#[generate unique hex color]",
-      "400": "#[generate unique hex color]",
-      "500": "#[generate unique hex color]",
-      "600": "#[generate unique hex color]",
-      "700": "#[generate unique hex color]",
-      "800": "#[generate unique hex color]",
-      "900": "#[generate unique hex color]"
-    },
-    "accent": {
-      "50": "#[generate unique hex color]",
-      "100": "#[generate unique hex color]",
-      "200": "#[generate unique hex color]",
-      "300": "#[generate unique hex color]",
-      "400": "#[generate unique hex color]",
-      "500": "#[generate unique hex color]",
-      "600": "#[generate unique hex color]",
-      "700": "#[generate unique hex color]",
-      "800": "#[generate unique hex color]",
-      "900": "#[generate unique hex color]"
-    },
-    "neutral": {
-      "50": "#[generate unique hex color]",
-      "100": "#[generate unique hex color]",
-      "200": "#[generate unique hex color]",
-      "300": "#[generate unique hex color]",
-      "400": "#[generate unique hex color]",
-      "500": "#[generate unique hex color]",
-      "600": "#[generate unique hex color]",
-      "700": "#[generate unique hex color]",
-      "800": "#[generate unique hex color]",
-      "900": "#[generate unique hex color]"
-    },
-    "success": {
-      "50": "#[generate unique hex color]",
-      "100": "#[generate unique hex color]",
-      "200": "#[generate unique hex color]",
-      "300": "#[generate unique hex color]",
-      "400": "#[generate unique hex color]",
-      "500": "#[generate unique hex color]",
-      "600": "#[generate unique hex color]",
-      "700": "#[generate unique hex color]",
-      "800": "#[generate unique hex color]",
-      "900": "#[generate unique hex color]"
-    },
-    "warning": {
-      "50": "#[generate unique hex color]",
-      "100": "#[generate unique hex color]",
-      "200": "#[generate unique hex color]",
-      "300": "#[generate unique hex color]",
-      "400": "#[generate unique hex color]",
-      "500": "#[generate unique hex color]",
-      "600": "#[generate unique hex color]",
-      "700": "#[generate unique hex color]",
-      "800": "#[generate unique hex color]",
-      "900": "#[generate unique hex color]"
-    },
-    "error": {
-      "50": "#[generate unique hex color]",
-      "100": "#[generate unique hex color]",
-      "200": "#[generate unique hex color]",
-      "300": "#[generate unique hex color]",
-      "400": "#[generate unique hex color]",
-      "500": "#[generate unique hex color]",
-      "600": "#[generate unique hex color]",
-      "700": "#[generate unique hex color]",
-      "800": "#[generate unique hex color]",
-      "900": "#[generate unique hex color]"
-    },
-    "info": {
-      "50": "#[generate unique hex color]",
-      "100": "#[generate unique hex color]",
-      "200": "#[generate unique hex color]",
-      "300": "#[generate unique hex color]",
-      "400": "#[generate unique hex color]",
-      "500": "#[generate unique hex color]",
-      "600": "#[generate unique hex color]",
-      "700": "#[generate unique hex color]",
-      "800": "#[generate unique hex color]",
-      "900": "#[generate unique hex color]"
-    }
-  },
-  "spacing": {
-    "xs": "[generate spacing between 2px-8px, prefer 4px]",
-    "sm": "[generate spacing between 6px-12px, prefer 8px]",
-    "md": "[generate spacing between 12px-20px, prefer 16px]",
-    "lg": "[generate spacing between 20px-32px, prefer 24px]",
-    "xl": "[generate spacing between 28px-40px, prefer 32px]",
-    "2xl": "[generate spacing between 40px-56px, prefer 48px]",
-    "3xl": "[generate spacing between 56px-80px, prefer 64px]"
-  },
-  "radii": {
-    "none": "0px",
-    "sm": "[generate radius between 2px-6px, prefer 4px]",
-    "md": "[generate radius between 6px-12px, prefer 8px]",
-    "lg": "[generate radius between 10px-18px, prefer 12px]",
-    "xl": "[generate radius between 14px-24px, prefer 16px]",
-    "2xl": "[generate radius between 20px-32px, prefer 24px]",
-    "full": "9999px"
-  },
-  "fonts": {
-    "heading": "[choose from: Inter, Roboto, Open Sans, Poppins, Montserrat, or similar modern sans-serif]",
-    "body": "[choose from: Inter, Roboto, Open Sans, Poppins, Montserrat, or similar modern sans-serif]",
-    "mono": "[choose from: JetBrains Mono, Fira Code, Source Code Pro, or similar monospace]",
-    "display": "[choose from: Playfair Display, Merriweather, Lora, or similar serif fonts]"
-  },
-  "fontSizes": {
-    "xs": "[generate between 10px-14px, prefer 12px]",
-    "sm": "[generate between 12px-16px, prefer 14px]",
-    "md": "[generate between 14px-18px, prefer 16px]",
-    "lg": "[generate between 16px-22px, prefer 18px]",
-    "xl": "[generate between 18px-24px, prefer 20px]",
-    "2xl": "[generate between 22px-28px, prefer 24px]",
-    "3xl": "[generate between 26px-36px, prefer 30px]",
-    "4xl": "[generate between 32px-42px, prefer 36px]",
-    "5xl": "[generate between 42px-54px, prefer 48px]",
-    "6xl": "[generate between 54px-72px, prefer 60px]"
-  },
-  "fontWeights": {
-    "hairline": "100",
-    "thin": "200",
-    "light": "300",
-    "normal": "400",
-    "medium": "500",
-    "semibold": "600",
-    "bold": "700",
-    "extrabold": "800",
-    "black": "900"
-  },
-  "lineHeights": {
-    "none": "1",
-    "tight": "[generate between 1.1-1.3, prefer 1.25]",
-    "snug": "[generate between 1.3-1.4, prefer 1.375]",
-    "normal": "1.5",
-    "relaxed": "[generate between 1.5-1.7, prefer 1.625]",
-    "loose": "2"
-  },
-  "shadows": {
-    "xs": "[generate subtle shadow: 0 1px 2-4px rgba(0,0,0,0.05-0.1)]",
-    "sm": "[generate light shadow: 0 1px 3-6px rgba(0,0,0,0.08-0.15)]",
-    "md": "[generate medium shadow: 0 4-8px 6-12px rgba(0,0,0,0.08-0.15)]",
-    "lg": "[generate prominent shadow: 0 8-16px 15-25px rgba(0,0,0,0.08-0.15)]",
-    "xl": "[generate large shadow: 0 16-24px 25-35px rgba(0,0,0,0.08-0.15)]",
-    "2xl": "[generate dramatic shadow: 0 20-30px 50-60px rgba(0,0,0,0.15-0.25)]",
-    "inner": "[generate inner shadow: inset 0 2-4px 4-8px rgba(0,0,0,0.05-0.1)]",
-    "outline": "[generate outline: 0 0 0 2-4px rgba(66,153,225,0.3-0.6)]"
-  },
-  "borders": {
-    "widths": {
-      "none": "0px",
-      "thin": "[generate between 1px-2px, prefer 1px]",
-      "thick": "[generate between 2px-4px, prefer 3px]"
-    },
-    "styles": {
-      "solid": "solid",
-      "dashed": "dashed",
-      "dotted": "dotted",
-      "double": "double",
-      "groove": "groove",
-      "ridge": "ridge",
-      "inset": "inset",
-      "outset": "outset"
-    }
-  },
-  "gradients": {
-    "primary": "[generate gradient using brand colors from above]",
-    "secondary": "[generate gradient using accent colors from above]",
-    "accent": "[generate gradient using info/success colors from above]",
-    "neutral": "[generate gradient using neutral colors from above]"
-  },
-  "backgrounds": {
-    "primary": "[generate using brand colors with 0.9-0.98 opacity]",
-    "secondary": "[generate using neutral colors with 0.9-0.98 opacity]",
-    "tertiary": "[generate using neutral colors with 0.85-0.95 opacity]",
-    "overlay": "[generate using neutral colors with 0.4-0.7 opacity]"
-  },
-  "animations": {
-    "duration": {
-      "fast": "[generate between 100ms-200ms, prefer 150ms]",
-      "normal": "[generate between 250ms-400ms, prefer 300ms]",
-      "slow": "[generate between 400ms-700ms, prefer 500ms]"
-    },
-    "easing": {
-      "linear": "linear",
-      "ease": "ease",
-      "easeIn": "ease-in",
-      "easeOut": "ease-out",
-      "easeInOut": "ease-in-out"
-    }
-  },
-  "breakpoints": {
-    "sm": "[generate between 600px-680px, prefer 640px]",
-    "md": "[generate between 720px-800px, prefer 768px]",
-    "lg": "[generate between 960px-1080px, prefer 1024px]",
-    "xl": "[generate between 1200px-1360px, prefer 1280px]",
-    "2xl": "[generate between 1440px-1600px, prefer 1536px]"
-  }
-}
-
-IMPORTANT: 
-- Do NOT copy the example values above
-- Generate completely new, creative values that fit the theme description
-- STAY WITHIN the specified ranges for spacing, radii, font sizes, etc.
-- Use the "prefer" values as defaults when appropriate
-- Create a cohesive, professional design system that:
-  1. Matches the theme description "${input.description}"
-  2. Uses appropriate color palettes (warm, cool, neutral, etc.) based on the theme
-  3. Includes realistic CSS values for all properties
-  4. Uses modern CSS techniques like rgba, gradients, and shadows
-  5. Ensures all values are valid CSS properties
-  6. Makes each theme unique and different from the examples`;
-
-  
     try {
+      console.log('🤖 [THEME_GEN] Preparing OpenAI request...');
       const params: any = {
-        model,
+        model: this.GENERATE_MODEL,
         messages: [
           {
             role: 'system',
             content:
-              'You are a UI design expert. Always respond with valid JSON only, no additional text or explanations.',
+              'You are a UI design expert. Always respond with valid JSON only, no extra text.'
           },
           { role: 'user', content: prompt },
         ],
         temperature: 1,
-        // forces the model to return a JSON object (no code fences)
         response_format: { type: 'json_object' },
+        max_completion_tokens: this.MAX_TOKENS_GEN,
       };
-  
 
-      if (/^gpt-5/.test(model)) {
-        params.max_completion_tokens = 40000;
-      } else {
-        params.max_completion_tokens = 40000;
-      }
-  
-      let completion;
-      try {
-        completion = await this.openai.chat.completions.create(params);
-      } catch (openaiError: any) {
-        console.error('OpenAI API call failed:', openaiError);
-        throw new Error(`OpenAI API call failed: ${openaiError.message}`);
-      }
+      console.log('🔧 [THEME_GEN] Request params:', {
+        model: params.model,
+        maxTokens: params.max_completion_tokens,
+        messageCount: params.messages.length,
+        promptLength: prompt.length
+      });
+
+      console.log('⏳ [THEME_GEN] Calling OpenAI API with timeout:', this.TIMEOUT_MS, 'ms...');
+      const apiCallStart = Date.now();
       
+      const completion = await this.withTimeout(
+        this.openai.chat.completions.create(params),
+        this.TIMEOUT_MS
+      );
+
+      const apiCallDuration = Date.now() - apiCallStart;
+      console.log('✅ [THEME_GEN] OpenAI API call completed in:', apiCallDuration, 'ms');
+
       let responseContent = completion.choices[0]?.message?.content?.trim();
       if (!responseContent) {
+        console.error('❌ [THEME_GEN] No response content from OpenAI');
         throw new Error('No response from OpenAI');
       }
-  
-      // (Defensive) strip accidental code fences if any slipped through.
-      responseContent = responseContent.replace(/^```json\s*|\s*```$/g, '');
-  
-      const parsedTokens = JSON.parse(responseContent);
-  
+      
+      console.log('📄 [THEME_GEN] Raw response length:', responseContent.length, 'chars');
+      console.log('📄 [THEME_GEN] Response preview:', responseContent.substring(0, 200) + '...');
+      
+      console.log('🧹 [THEME_GEN] Cleaning response...');
+      responseContent = this.stripCodeFences(responseContent);
+      console.log('🧹 [THEME_GEN] Cleaned response length:', responseContent.length, 'chars');
+
+      console.log('🔍 [THEME_GEN] Parsing JSON...');
+      const parseStart = Date.now();
+      const parsedTokens = this.safeJsonParse(responseContent, 'Theme generation JSON parse failed');
+      const parseDuration = Date.now() - parseStart;
+      console.log('✅ [THEME_GEN] JSON parsed in:', parseDuration, 'ms');
+
+      console.log('✅ [THEME_GEN] Validating against schema...');
+      const validationStart = Date.now();
       const validatedTokens = ThemeTokensSchema.parse(parsedTokens);
-  
+      const validationDuration = Date.now() - validationStart;
+      console.log('✅ [THEME_GEN] Schema validation passed in:', validationDuration, 'ms');
+
       const generatedTheme = {
         id: `generated-${Date.now()}`,
         name: `Generated: ${input.description}`,
@@ -339,522 +189,500 @@ IMPORTANT:
         basedOnThemeId: null,
         notes: `AI-generated theme based on description: "${input.description}"`,
       };
-  
+
+      const totalDuration = Date.now() - startTime;
+      console.log('🎉 [THEME_GEN] Theme generation completed successfully in:', totalDuration, 'ms');
+      console.log('🆔 [THEME_GEN] Generated theme ID:', generatedTheme.id);
+
       await this.audit.log('theme.generate', {
         description: input.description,
         generatedId: generatedTheme.id,
+        model: this.GENERATE_MODEL,
       });
-  
+
       return generatedTheme;
     } catch (error: any) {
+      const totalDuration = Date.now() - startTime;
+      console.error('💥 [THEME_GEN] Theme generation failed after:', totalDuration, 'ms');
+      console.error('💥 [THEME_GEN] Error type:', error.constructor.name);
+      console.error('💥 [THEME_GEN] Error message:', error?.message || String(error));
+      console.error('💥 [THEME_GEN] Error stack:', error?.stack);
+      
       await this.audit.log('theme.generate.error', {
         description: input.description,
-        error: error.message,
+        error: error?.message || String(error),
+        model: this.GENERATE_MODEL,
       });
       throw error;
     }
   }
-  
+
+  // ======================================================
+  // ===================== Deletion =======================
+  // ======================================================
   async deleteTheme(id: string) {
     const theme = await this.repo.findOne({ where: { id } });
     if (!theme) {
       throw new NotFoundException('Theme not found');
     }
-    
+
     await this.repo.remove(theme);
     await this.audit.log('theme.delete', { id });
-    
+
     return `Theme "${theme.name || id}" deleted successfully`;
   }
 
-  // Theme amendment methods
+  // ======================================================
+  // ================== Amendment helpers =================
+  // ======================================================
+
   private resolveScopeToPaths(scope: NonNullable<AmendThemeInput['scope']>): string[] {
-    console.log('🗺️ [PATH RESOLUTION] Resolving scope to paths:', scope);
-    
     const out: string[] = [];
     for (const s of scope) {
       if (s === 'notifications') {
         out.push('/colors/success', '/colors/warning', '/colors/error', '/colors/info');
-        console.log('🗺️ [PATH RESOLUTION] Mapped notifications to:', ['/colors/success', '/colors/warning', '/colors/error', '/colors/info']);
-      }
-      else if (s === 'spacing') {
+      } else if (s === 'spacing') {
         out.push('/spacing');
-        console.log('🗺️ [PATH RESOLUTION] Mapped spacing to:', ['/spacing']);
-      }
-      else if (s === 'radii') {
+      } else if (s === 'radii') {
         out.push('/radii');
-        console.log('🗺️ [PATH RESOLUTION] Mapped radii to:', ['/radii']);
-      }
-      else if (s === 'brandColors') {
-        out.push('/colors');
-        console.log('🗺️ [PATH RESOLUTION] Mapped brandColors to:', ['/colors']);
-      }
-      else if (s === 'accentColors') {
-        out.push('/colors');
-        console.log('🗺️ [PATH RESOLUTION] Mapped accentColors to:', ['/colors']);
-      }
-      else if (s === 'typography') {
+      } else if (s === 'brandColors') {
+        out.push('/colors/brand');
+      } else if (s === 'accentColors') {
+        out.push('/colors/accent');
+      } else if (s === 'typography') {
         out.push('/fonts', '/fontSizes', '/fontWeights', '/lineHeights');
-        console.log('🗺️ [PATH RESOLUTION] Mapped typography to:', ['/fonts', '/fontSizes', '/fontWeights', '/lineHeights']);
-      }
-      else if (s === 'layout') {
-        out.push('/breakpoints', '/grid', '/flexbox');
-        console.log('🗺️ [PATH RESOLUTION] Mapped layout to:', ['/breakpoints', '/grid', '/flexbox']);
-      }
-      else if (s === 'shadows') {
+      } else if (s === 'layout') {
+        out.push('/breakpoints');
+      } else if (s === 'shadows') {
         out.push('/shadows');
-        console.log('🗺️ [PATH RESOLUTION] Mapped shadows to:', ['/shadows']);
-      }
-      else if (s === 'borders') {
+      } else if (s === 'borders') {
         out.push('/borders');
-        console.log('🗺️ [PATH RESOLUTION] Mapped borders to:', ['/borders']);
-      }
-      else if (s === 'animations') {
+      } else if (s === 'animations') {
         out.push('/animations');
-        console.log('🗺️ [PATH RESOLUTION] Mapped animations to:', ['/animations']);
       }
     }
-    
-    console.log('🗺️ [PATH RESOLUTION] Final resolved paths:', out);
     return out;
   }
 
   private pickSubtree(tokens: any, prefixes: string[]) {
-    console.log('🌳 [SUBTREE PICKING] Picking subtree with prefixes:', prefixes);
-    
     const out: any = {};
     for (const p of prefixes) {
       const parts = p.split('/').filter(Boolean);
-      console.log('🌳 [SUBTREE PICKING] Processing path:', p, '→ parts:', parts);
-      
       let src = tokens;
       let ok = true;
       for (const k of parts) {
         if (src && Object.prototype.hasOwnProperty.call(src, k)) {
           src = src[k];
-          console.log('🌳 [SUBTREE PICKING] Found key:', k, '→ value:', src);
         } else {
-          console.warn('🌳 [SUBTREE PICKING] Missing key:', k, 'in path:', p);
-          ok = false;
-          break;
+          ok = false; break;
         }
       }
-      
-      if (!ok) {
-        console.warn('🌳 [SUBTREE PICKING] Skipping invalid path:', p);
-        continue;
-      }
-      
+      if (!ok) continue;
+
       let cur = out;
       parts.forEach((k, i) => {
         if (i === parts.length - 1) {
           cur[k] = src;
-          console.log('🌳 [SUBTREE PICKING] Set final value for:', k, '→', src);
         } else {
           cur[k] ??= {};
           cur = cur[k];
         }
       });
     }
-    
-    console.log('🌳 [SUBTREE PICKING] Final subtree extracted:', out);
     return out;
   }
 
   private applySubtree(tokens: any, prefixes: string[], subtree: any) {
-    console.log('🔀 [APPLY SUBTREE] Starting applySubtree...');
-    console.log('🔀 [APPLY SUBTREE] Prefixes to apply:', prefixes);
-    console.log('🔀 [APPLY SUBTREE] Subtree to apply:', subtree);
-    
     const next = JSON.parse(JSON.stringify(tokens));
-    console.log('🔀 [APPLY SUBTREE] Deep cloned tokens for modification');
-    
     for (const p of prefixes) {
       const parts = p.split('/').filter(Boolean);
-      console.log('🔀 [APPLY SUBTREE] Processing path:', p, '→ parts:', parts);
-      
       let dst = next;
       let src = subtree;
-      
       for (let i = 0; i < parts.length; i++) {
         const k = parts[i];
         if (i === parts.length - 1) {
           if (src && src[k] !== undefined) {
-            console.log('🔀 [APPLY SUBTREE] Setting final value for:', k, '→', src[k]);
             dst[k] = src[k];
-          } else {
-            console.warn('🔀 [APPLY SUBTREE] No value to set for:', k, 'in path:', p);
           }
         } else {
           dst[k] ??= {};
           dst = dst[k];
           src = src?.[k];
-          console.log('🔀 [APPLY SUBTREE] Navigating to:', k, 'src exists:', !!src);
         }
       }
     }
-    
-    console.log('🔀 [APPLY SUBTREE] Subtree application completed');
     return next;
   }
 
-  private async detectSectionsFromInstruction(instruction: string): Promise<Array<'notifications' | 'spacing' | 'radii' | 'brandColors' | 'accentColors' | 'typography' | 'layout' | 'shadows' | 'borders' | 'animations'>> {
-    console.log('🔍 [SECTION DETECTION] Starting section detection for instruction:', instruction);
-    
-    try {
-      console.log('🔍 [SECTION DETECTION] Making GPT-5-nano call for section detection...');
-      
-      const res = await this.openai.chat.completions.create({
-        model: 'gpt-5-nano',
-        messages: [
-          {
-            role: 'system',
-            content: `You are a theme section detector. Given a user instruction, determine which theme sections are being modified.
+  private computeAllowedPathsFromInstruction(instruction: string): string[] {
+    const t = instruction.toLowerCase();
+    const out = new Set<string>();
 
-Available sections:
-- colors (for any color-related changes)
-- spacing (for spacing, margins, padding changes)
-- radii (for border radius changes)
-- typography (for font, text changes)
-- shadows (for shadow, elevation changes)
-- borders (for border changes)
-- animations (for animation, transition changes)
-
-Respond with ONLY a comma-separated list of section names, no other text. Example: "colors,spacing" or just "colors" if only one section.`
-          },
-                    {
-            role: 'user',
-            content: instruction
-          }
-        ],
-        temperature: 1,
-        max_completion_tokens: 50000,
-        response_format: { type: 'text' }
-      });
-
-      const content = res.choices[0]?.message?.content?.trim();
-      console.log('🔍 [SECTION DETECTION] Raw AI response:', content);
-      console.log('🔍 [SECTION DETECTION] Usage - Prompt tokens:', res.usage?.prompt_tokens, 'Completion tokens:', res.usage?.completion_tokens, 'Total tokens:', res.usage?.total_tokens);
-      
-      if (!content) {
-        console.warn('🔍 [SECTION DETECTION] Empty AI response');
-        return ['brandColors', 'accentColors']; // fallback to colors
+    if (/\bcolors?\b/.test(t) || /\bbrand|primary\b/.test(t) || /\baccent|secondary\b/.test(t) ||
+        /\bneutral|gray|grey\b/.test(t) || /\bsuccess|warning|error|danger|info\b/.test(t) ||
+        /\bnotifications|alerts|statuses\b/.test(t)) {
+      if (/\bbrand|primary\b/.test(t)) out.add('/colors/brand');
+      if (/\baccent|secondary\b/.test(t)) out.add('/colors/accent');
+      if (/\bneutral|gray|grey\b/.test(t)) out.add('/colors/neutral');
+      if (/\bsuccess\b/.test(t)) out.add('/colors/success');
+      if (/\bwarning\b/.test(t)) out.add('/colors/warning');
+      if (/\b(error|danger)\b/.test(t)) out.add('/colors/error');
+      if (/\binfo|informational|notice\b/.test(t)) out.add('/colors/info');
+      if (/\bnotifications|alerts|statuses\b/.test(t)) {
+        out.add('/colors/success'); out.add('/colors/warning'); out.add('/colors/error'); out.add('/colors/info');
       }
-
-      // Parse comma-separated response
-      const sections = content.split(',').map(s => s.trim().toLowerCase());
-      console.log('🔍 [SECTION DETECTION] Parsed sections:', sections);
-      console.log('🔍 [SECTION DETECTION] Raw AI response (lowercase):', content.toLowerCase());
-      
-      // Map to valid section names - simplified to use 'colors' for all color-related changes
-      const validSections: Array<'notifications' | 'spacing' | 'radii' | 'brandColors' | 'accentColors' | 'typography' | 'layout' | 'shadows' | 'borders' | 'animations'> = [];
-      
-      for (const section of sections) {
-        if (section === 'colors' || section === 'color' || section === 'accentcolors') {
-          validSections.push('brandColors', 'accentColors');
-        } else if (section === 'spacing') {
-          validSections.push('spacing');
-        } else if (section === 'radii' || section === 'radius') {
-          validSections.push('radii');
-        } else if (section === 'typography' || section === 'font' || section === 'text') {
-          validSections.push('typography');
-        } else if (section === 'shadows' || section === 'shadow') {
-          validSections.push('shadows');
-        } else if (section === 'borders' || section === 'border') {
-          validSections.push('borders');
-        } else if (section === 'animations' || section === 'animation') {
-          validSections.push('animations');
-        }
+      if (Array.from(out).filter(p => p.startsWith('/colors/')).length === 0) {
+        out.add('/colors/brand'); out.add('/colors/accent');
       }
-
-      console.log('🔍 [SECTION DETECTION] Final valid sections:', validSections);
-      
-      if (validSections.length === 0) {
-        console.warn('🔍 [SECTION DETECTION] No valid sections found, using fallback');
-        return ['brandColors', 'accentColors'];
-      }
-
-      return validSections;
-    } catch (error) {
-      console.error('🔍 [SECTION DETECTION] Section detection failed:', error);
-      console.warn('🔍 [SECTION DETECTION] Falling back to default: colors');
-      return ['brandColors', 'accentColors'];
     }
+
+    if (/\bgradient\b/.test(t)) out.add('/gradients');
+    if (/\boverlay|backgrounds?\b/.test(t)) out.add('/backgrounds');
+    if (/\bspacing|gaps?|gutters?|density|white\s*space\b/.test(t)) out.add('/spacing');
+    if (/\bradius|radii|corners?|rounded|pill|square|sharp/.test(t)) out.add('/radii');
+    if (/\bfont|typography|typeface|line[-\s]?height|leading|weight\b/.test(t)) {
+      out.add('/fonts'); out.add('/fontSizes'); out.add('/fontWeights'); out.add('/lineHeights');
+    }
+    if (/\bshadow|elevation|depth\b/.test(t)) out.add('/shadows');
+    if (/\bborder\b/.test(t)) out.add('/borders');
+    if (/\banimation|transition|easing\b/.test(t)) out.add('/animations');
+    if (/\bbreakpoint|mobile|tablet|desktop|laptop|ultrawide|2xl\b/.test(t)) out.add('/breakpoints');
+
+    return Array.from(out);
   }
 
-
+  // ======================================================
+  // ================== AI fallbacks only =================
+  // ======================================================
 
   private async regenSubtree(tokens: any, instruction: string, scope?: AmendThemeInput['scope']) {
-    console.log('🔄 [REGEN] Starting regenSubtree...');
-    console.log('🔄 [REGEN] Instruction:', instruction);
-    console.log('🔄 [REGEN] Manual scope:', scope);
-    
-    const allow = this.resolveScopeToPaths(scope ?? ['notifications' as const]);
-    console.log('🔄 [REGEN] Resolved allowed paths:', allow);
-    
+    if (!process.env.OPENAI_API_KEY) throw new Error('OpenAI API key not configured');
+
+    const allow = this.resolveScopeToPaths(scope ?? ['notifications']);
     const ctx = this.pickSubtree(tokens, allow);
-    console.log('🔄 [REGEN] Context subtree extracted, size:', JSON.stringify(ctx).length, 'chars');
-    
-    console.log('🔄 [REGEN] Making AI call for subtree regeneration...');
-    const res = await this.openai.chat.completions.create({
-      model: 'gpt-5-nano',
+
+    const messages = [
+      { role: 'system' as const, content: 'Return ONLY valid JSON. Keep the SAME OBJECT SHAPE (keys) as the given context. Do not add or remove keys.' },
+      { role: 'user' as const, content: `Instruction:\n${instruction}\n\nContext JSON (only edit values, keep keys identical):\n${JSON.stringify(ctx)}` },
+    ];
+
+    const params: any = {
+      model: this.PATCH_MODEL,
+      messages,
+      response_format: { type: 'json_object' },
+      temperature: 1,
+      max_completion_tokens: this.MAX_TOKENS_PAT,
+    };
+
+    const res = await this.withTimeout(this.openai.chat.completions.create(params), this.TIMEOUT_MS);
+    let content = res.choices[0]?.message?.content?.trim();
+    if (!content) throw new Error('Empty AI response');
+
+    content = this.stripCodeFences(content);
+    const patchSubtree = this.safeJsonParse(content, 'AI subtree JSON parse failed');
+
+    const merged = this.applySubtree(tokens, allow, patchSubtree);
+    return merged;
+  }
+
+  private async patchWithAI(tokens: any, instruction: string, manualScope?: AmendThemeInput['scope']) {
+    if (!process.env.OPENAI_API_KEY) throw new Error('OpenAI API key not configured');
+
+    const allow = manualScope
+      ? this.resolveScopeToPaths(manualScope)
+      : this.computeAllowedPathsFromInstruction(instruction);
+
+    const allowedPaths = allow.length ? allow : ['/colors/brand', '/colors/accent'];
+    const ctx = this.pickSubtree(tokens, allowedPaths);
+    const ctxJson = JSON.stringify(ctx);
+
+    const system = [
+      'You are a JSON Patch generator.',
+      'Return ONLY a JSON object with one key "patch" whose value is a valid RFC6902 JSON Patch array.',
+      'Every operation MUST use an allowed path or a descendant of an allowed path.',
+      'If updating a color PALETTE (e.g., /colors/brand), you MUST provide the FULL object with shades 50,100,...,900.',
+      'If the instruction mentions multiple explicit values (e.g., "xl and 2xl"), you MUST include separate operations for each.',
+    ].join(' ');
+
+    const user = [
+      `Instruction: ${instruction}`,
+      '',
+      `Allowed path prefixes (writes beyond these MUST NOT appear):`,
+      JSON.stringify(allowedPaths),
+      '',
+      'Context JSON (this is the ONLY data you can rely on for current values):',
+      ctxJson,
+      '',
+      'Output contract:',
+      '{ "patch": [ { "op": "replace|add|remove", "path": "/path", "value": any? }, ... ] }',
+    ].join('\n');
+
+    const params: any = {
+      model: this.PATCH_MODEL,
       messages: [
-        { role: 'system', content: 'Return ONLY valid JSON of the same keys; no prose.' },
-        { role: 'user', content: `Instruction: ${instruction}\nCurrent subtree:\n${JSON.stringify(ctx)}` }
+        { role: 'system', content: system },
+        { role: 'user', content: user },
       ],
       response_format: { type: 'json_object' },
       temperature: 1,
-      max_completion_tokens: 50000
-    });
-    
-    const content = res.choices[0]?.message?.content?.trim();
-    console.log('🔄 [REGEN] Raw AI response:', content);
-    console.log('🔄 [REGEN] Usage - Prompt tokens:', res.usage?.prompt_tokens, 'Completion tokens:', res.usage?.completion_tokens, 'Total tokens:', res.usage?.total_tokens);
-    
-    if (!content) {
-      console.error('🔄 [REGEN] Empty AI response');
-      throw new Error('Empty AI response');
-    }
-    
-    const patchSubtree = JSON.parse(content);
-    console.log('🔄 [REGEN] Parsed regenerated subtree');
-    
-    console.log('🔄 [REGEN] Applying regenerated subtree...');
-    const result = this.applySubtree(tokens, allow, patchSubtree);
-    console.log('🔄 [REGEN] Subtree applied successfully');
-    
-    return result;
-  }
+      max_completion_tokens: this.MAX_TOKENS_PAT,
+    };
 
-  private async patchWithAI(tokens: any, instruction: string, scope?: AmendThemeInput['scope']) {
-    console.log('🔧 [PATCH AI] Starting patchWithAI...');
-    console.log('🔧 [PATCH AI] Instruction:', instruction);
-    console.log('🔧 [PATCH AI] Manual scope:', scope);
-    
-    let allow: string[];
-    if (scope) {
-      console.log('🔧 [PATCH AI] Using manual scope');
-      allow = this.resolveScopeToPaths(scope);
+    const res = await this.withTimeout(this.openai.chat.completions.create(params), this.TIMEOUT_MS);
+    let raw = res.choices[0]?.message?.content?.trim();
+    if (!raw) throw new Error('Empty AI response');
+    raw = this.stripCodeFences(raw);
+
+    // Accept either { patch: [...] } or a direct array (be forgiving)
+    const parsed = this.safeJsonParse<any>(raw, 'AI patch JSON parse failed');
+
+    let aiOps: AIJsonPatchOp[];
+    if (Array.isArray(parsed)) {
+      aiOps = parsed as AIJsonPatchOp[];
+    } else if (parsed?.patch && Array.isArray(parsed.patch)) {
+      aiOps = parsed.patch as AIJsonPatchOp[];
+    } else if (parsed?.operations && Array.isArray(parsed.operations)) {
+      aiOps = parsed.operations as AIJsonPatchOp[];
+    } else if (parsed?.op && parsed?.path) {
+      aiOps = [parsed as AIJsonPatchOp];
     } else {
-      console.log('🔧 [PATCH AI] Auto-detecting sections...');
-      const detectedSections = await this.detectSectionsFromInstruction(instruction);
-      allow = this.resolveScopeToPaths(detectedSections);
+      throw new BadRequestException('AI did not return a JSON Patch array');
     }
-    
-    console.log('🔧 [PATCH AI] Resolved allowed paths:', allow);
-    
-    const ctx = this.pickSubtree(tokens, allow);
-    console.log('🔧 [PATCH AI] Context subtree extracted, size:', JSON.stringify(ctx).length, 'chars');
-    
-    console.log('🔧 [PATCH AI] Making AI call for JSON patch generation...');
-    console.log('🔧 [PATCH AI] Full instruction being sent to AI:', instruction);
-    
-    // Analyze the instruction to identify multiple values
-    const instructionLower = instruction.toLowerCase();
-    const hasMultipleValues = /and|&|,|plus|\+/.test(instructionLower);
-    const hasXlAnd2xl = /xl.*2xl|2xl.*xl/.test(instructionLower);
-    
-    console.log('🔧 [PATCH AI] Instruction analysis - hasMultipleValues:', hasMultipleValues, 'hasXlAnd2xl:', hasXlAnd2xl);
-    
-    let enhancedPrompt = `Instruction: ${instruction}\n\n`;
-    
-    if (hasMultipleValues) {
-      enhancedPrompt += `🚨 CRITICAL: This instruction mentions MULTIPLE values that need updating!\n`;
-      enhancedPrompt += `You MUST create a separate patch operation for EACH mentioned value.\n`;
-      enhancedPrompt += `Do NOT update just one value - update ALL mentioned values.\n\n`;
-    }
-    
-    if (hasXlAnd2xl) {
-      enhancedPrompt += `🎯 SPECIFIC: This mentions "xl and 2xl" - you MUST update BOTH:\n`;
-      enhancedPrompt += `- Update /fontSizes/xl to a slightly larger value\n`;
-      enhancedPrompt += `- Update /fontSizes/2xl to a slightly larger value\n`;
-      enhancedPrompt += `Create TWO separate patch operations.\n\n`;
-    }
-    
-    enhancedPrompt += `IMPORTANT: If this instruction involves updating colors, you MUST update the ENTIRE color palette (all 10 shades: 50, 100, 200, 300, 400, 500, 600, 700, 800, 900). Do not update just one or two colors.\n\n`;
-    enhancedPrompt += `Allowed prefixes: ${JSON.stringify(allow)}\nContext:\n${JSON.stringify(ctx)}`;
-    
-    console.log('🔧 [PATCH AI] Enhanced user prompt being sent to AI:', enhancedPrompt);
-    
-    const res = await this.openai.chat.completions.create({
-        model: 'gpt-5-nano',
-        messages: [
-          { 
-            role: 'system', 
-            content: 'You are a JSON Patch expert. Return ONLY a valid RFC6902 JSON Patch array. Each operation must have: op (replace/add/remove), path (JSON pointer), and value (except for remove operations). IMPORTANT: Use the exact paths from the allowed prefixes. If you see "/colors" as allowed, use paths like "/colors/brand", "/colors/accent", "/colors/success", etc. CRITICAL: When updating color palettes, you MUST update ALL color values in that palette (50, 100, 200, 300, 400, 500, 600, 700, 800, 900). Do NOT update just one color - update the entire palette. CRITICAL: When updating multiple specific values (like "xl and 2xl font sizes"), you MUST update ALL mentioned values, not just one. Examples: To update accent colors to green: [{"op":"replace","path":"/colors/accent","value":{"50":"#e6f7e6","100":"#ccefcc","200":"#b3e7b3","300":"#99df99","400":"#80d780","500":"#66cf66","600":"#4dc74d","700":"#33bf33","800":"#1ab71a","900":"#00af00"}}]. To update neutral colors to grays: [{"op":"replace","path":"/colors/neutral","value":{"50":"#fafafa","100":"#f5f5f5","200":"#eeeeee","300":"#e0e0e0","400":"#bdbdbd","500":"#9e9e9e","600":"#757575","700":"#616161","800":"#424242","900":"#212121"}}]. To update xl and 2xl font sizes: [{"op":"replace","path":"/fontSizes/xl","value":"22px"},{"op":"replace","path":"/fontSizes/2xl","value":"26px"}]' 
-          },
-          { role: 'user', content: enhancedPrompt }
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 1,
-        max_completion_tokens: 50000
-      });
-    
-    const raw = res.choices[0]?.message?.content?.trim();
-    console.log('🔧 [PATCH AI] Raw AI response:', raw);
-    console.log('🔧 [PATCH AI] Usage - Prompt tokens:', res.usage?.prompt_tokens, 'Completion tokens:', res.usage?.completion_tokens, 'Total tokens:', res.usage?.total_tokens);
-    
-    if (!raw) {
-      console.error('🔧 [PATCH AI] Empty AI response');
-      throw new Error('Empty AI response');
-    }
-    
-    let patch;
-    try {
-      const parsed = JSON.parse(raw);
-      // The AI might return the patch directly as an array, or wrapped in an object, or as a single operation
-      if (Array.isArray(parsed)) {
-        patch = parsed;
-      } else if (parsed.patch && Array.isArray(parsed.patch)) {
-        patch = parsed.patch;
-      } else if (parsed.operations && Array.isArray(parsed.operations)) {
-        patch = parsed.operations;
-      } else if (parsed.op && parsed.path) {
-        // Single patch operation
-        patch = [parsed];
-      } else {
-        console.error('🔧 [PATCH AI] Invalid response format - expected array, object with patch/operations, or single operation');
-        throw new Error('Invalid response format - expected JSON Patch array or single operation');
-      }
-    } catch (parseError) {
-      console.error('🔧 [PATCH AI] Failed to parse AI response as JSON:', parseError);
-      throw new Error('Invalid JSON response from AI');
-    }
-    
-    console.log('🔧 [PATCH AI] Parsed patch, operations:', patch.length);
-    
-    console.log('🔧 [PATCH AI] Validating patch operations...');
-    for (const op of patch) {
-      // Validate operation structure
-      if (!op.op || !op.path) {
-        console.error('🔧 [PATCH AI] Invalid operation - missing op or path:', op);
-        throw new Error('Invalid operation - missing op or path');
-      }
-      
-      if (!['replace', 'add', 'remove'].includes(op.op)) {
-        console.error('🔧 [PATCH AI] Invalid operation type:', op.op);
-        throw new Error(`Invalid operation type: ${op.op}`);
-      }
-      
-      if (op.op !== 'remove' && op.value === undefined) {
-        console.error('🔧 [PATCH AI] Missing value for non-remove operation:', op);
-        throw new Error('Missing value for non-remove operation');
-      }
-      
-      // Validate path format (basic JSON pointer validation)
-      if (!op.path.startsWith('/')) {
-        console.error('🔧 [PATCH AI] Invalid path format - must start with /:', op.path);
-        throw new Error('Invalid path format - must start with /');
-      }
-      
-      // Validate path is allowed
-      const isAllowed = allow.some(p => op.path === p || op.path.startsWith(p + '/'));
-      console.log('🔧 [PATCH AI] Operation:', op.op, 'Path:', op.path, 'Allowed:', isAllowed);
-      
-      if (!isAllowed) {
-        console.error('🔧 [PATCH AI] Forbidden path detected:', op.path);
-        throw new Error(`Forbidden path: ${op.path}`);
-      }
-    }
-    
-    console.log('🔧 [PATCH AI] All paths validated, applying patch...');
-    const result = jsonpatch.applyPatch(JSON.parse(JSON.stringify(tokens)), patch, true).newDocument;
-    console.log('🔧 [PATCH AI] Patch applied successfully');
-    
+
+    const ops = this.validateAndCoercePatch(aiOps, allowedPaths, ctx);
+
+    // Apply patch atomically on a deep clone
+    const result = jsonpatch.applyPatch(JSON.parse(JSON.stringify(tokens)), ops as readonly Operation[], true).newDocument;
     return result;
   }
 
-  private cleanupCache() {
-    const now = Date.now();
-    const oneHour = 60 * 60 * 1000; // 1 hour in milliseconds
-    
-    for (const [key, value] of this.amendmentCache.entries()) {
-      if (now - value.timestamp > oneHour) {
-        this.amendmentCache.delete(key);
-        console.log('🗑️ [CACHE] Cleaned up old cache entry:', key);
-      }
-    }
-  }
-
+  // ======================================================
+  // =================== Public: amend ====================
+  // ======================================================
   async amend(input: AmendThemeInput) {
-    console.log('🎯 [AMEND] Starting theme amendment for ID:', input.id);
-    console.log('🎯 [AMEND] Instruction:', input.instruction);
-    console.log('🎯 [AMEND] Manual scope:', input.scope);
-    console.log('🎯 [AMEND] Manual mode:', input.mode);
-    console.log('🎯 [AMEND] Dry run:', input.dryRun);
-    
     const theme = await this.get(input.id);
-    console.log('🎯 [AMEND] Theme loaded:', theme.id, theme.name);
-    console.log('🎯 [AMEND] Available theme paths:', Object.keys(theme.tokens));
-    console.log('🎯 [AMEND] Theme tokens sample:', JSON.stringify(theme.tokens, null, 2).substring(0, 500) + '...');
-    
-    // Check if we have cached changes for this theme and instruction
-    const cacheKey = `${input.id}:${input.instruction}`;
+
+    const fingerprint = this.simpleHash(JSON.stringify(theme.tokens)).toString(36);
+    const cacheKey = `${input.id}:${fingerprint}:${input.instruction}`;
     const cached = this.amendmentCache.get(cacheKey);
-    
+
     let next = theme.tokens;
     let diff: any;
-    
+
     if (cached && !input.dryRun) {
-      // Use cached changes when applying (not previewing)
-      console.log('🎯 [AMEND] Using cached changes from preview');
       next = cached.tokens;
       diff = cached.diff;
     } else {
-      // Generate new changes (either for preview or when no cache exists)
-      console.log('🎯 [AMEND] Generating new changes...');
-      
-      // Simple strategy: use regen for scoped requests, patch for general ones
-      const strategy = input.mode ?? (input.scope && input.scope.length > 0 ? 'regen' : 'patch');
-      console.log('🎯 [AMEND] Selected strategy:', strategy);
-
-      try {
+      // 1) Deterministic path (no AI)
+      const ops = parseInstructions(input.instruction);
+      if (ops.length > 0) {
+        const res = applyParsedOps(theme.tokens, ops);
+        next = res.next;
+        diff = res.diff;
+      } else {
+        // 2) No deterministic parse → choose strategy: 'regen' explicitly or 'patch' fallback
+        const strategy = input.mode ?? (input.scope && input.scope.length > 0 ? 'regen' : 'patch');
         if (strategy === 'regen') {
-          console.log('🎯 [AMEND] Using regeneration strategy');
           next = await this.regenSubtree(theme.tokens, input.instruction, input.scope);
         } else {
-          console.log('🎯 [AMEND] Using patch strategy');
           next = await this.patchWithAI(theme.tokens, input.instruction, input.scope);
         }
-      } catch (error) {
-        console.error('🎯 [AMEND] Error during theme modification:', error);
-        throw new Error(`Theme modification failed: ${error.message}`);
+        diff = jsonpatch.compare(theme.tokens, next);
       }
-      
-      // Generate diff for new changes
-      diff = jsonpatch.compare(theme.tokens, next);
-      console.log('🎯 [AMEND] Diff generated, operations:', diff.length);
-      
-      // Cache the changes for future use
+
       this.amendmentCache.set(cacheKey, { tokens: next, diff, timestamp: Date.now() });
-      console.log('🎯 [AMEND] Changes cached for future use');
-      
-      // Clean up old cache entries (older than 1 hour)
       this.cleanupCache();
     }
 
-    console.log('🎯 [AMEND] Tokens modified, validating with Zod...');
     const validated = ThemeTokensSchema.parse(next);
-    console.log('🎯 [AMEND] Zod validation passed');
 
     if (input.dryRun) {
-      console.log('🎯 [AMEND] Dry run mode - logging preview and returning');
       await this.audit.log('theme.amend.preview', { id: input.id, diff });
       return { ...theme, tokens: validated, _preview: true, diff };
     }
-    
-    console.log('🎯 [AMEND] Saving theme to database...');
+
     const saved = await this.repo.save({ ...theme, tokens: validated });
-    console.log('🎯 [AMEND] Theme saved successfully');
-    
     await this.audit.log('theme.amend', { id: input.id, diff });
-    console.log('🎯 [AMEND] Amendment completed successfully');
-    
     return saved;
   }
+
+  // ======================================================
+  // ==================== Misc helpers ====================
+  // ======================================================
+
+  private cleanupCache() {
+    const now = Date.now();
+    const oneHour = 60 * 60 * 1000;
+    for (const [key, value] of this.amendmentCache.entries()) {
+      if (now - value.timestamp > oneHour) {
+        this.amendmentCache.delete(key);
+      }
+    }
+  }
+
+  private stripCodeFences(s: string) {
+    return s.replace(/^```json\s*|\s*```$/g, '').trim();
+  }
+
+  private safeJsonParse<T = any>(s: string, errMsg: string): T {
+    try {
+      return JSON.parse(s) as T;
+    } catch {
+      throw new BadRequestException(errMsg);
+    }
+  }
+
+  private async withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+    console.log(`⏱️ [TIMEOUT] Setting timeout for ${ms}ms`);
+    const startTime = Date.now();
+    let to: any;
+    try {
+      const result = await Promise.race([
+        p.then(value => {
+          const duration = Date.now() - startTime;
+          console.log(`✅ [TIMEOUT] Promise resolved in ${duration}ms (under ${ms}ms limit)`);
+          return value;
+        }),
+        new Promise<T>((_, rej) => { 
+          to = setTimeout(() => {
+            const duration = Date.now() - startTime;
+            console.error(`⏰ [TIMEOUT] Promise timed out after ${duration}ms (limit: ${ms}ms)`);
+            console.error(`⏰ [TIMEOUT] This means OpenAI took longer than ${ms}ms to respond`);
+            console.error(`⏰ [TIMEOUT] Possible causes:`);
+            console.error(`⏰ [TIMEOUT] - Network latency or connection issues`);
+            console.error(`⏰ [TIMEOUT] - OpenAI API is experiencing high load`);
+            console.error(`⏰ [TIMEOUT] - Request is too complex for the model`);
+            console.error(`⏰ [TIMEOUT] - Rate limiting or quota issues`);
+            rej(new Error(`OpenAI request timed out after ${duration}ms`));
+          }, ms); 
+        })
+      ]);
+      return result;
+    } finally {
+      if (to) {
+        console.log(`🧹 [TIMEOUT] Cleaning up timeout handler`);
+        clearTimeout(to);
+      }
+    }
+  }
+
+  private simpleHash(s: string) {
+    let h = 0, i = 0, len = s.length;
+    while (i < len) {
+      h = (h << 5) - h + s.charCodeAt(i++) | 0;
+    }
+    return h >>> 0;
+  }
+
+  private buildThemeGenerationPrompt(description: string) {
+    return `
+You are an expert UI designer and CSS specialist.
+Given a description of a theme, create a cohesive design system and output ONLY valid JSON that matches this shape:
+
+{
+  "colors": {
+    "brand": { "50": "#HEX", "100": "#HEX", "200": "#HEX", "300": "#HEX", "400": "#HEX", "500": "#HEX", "600": "#HEX", "700": "#HEX", "800": "#HEX", "900": "#HEX" },
+    "accent": { "50": "#HEX", "100": "#HEX", "200": "#HEX", "300": "#HEX", "400": "#HEX", "500": "#HEX", "600": "#HEX", "700": "#HEX", "800": "#HEX", "900": "#HEX" },
+    "neutral": { "50": "#HEX", "100": "#HEX", "200": "#HEX", "300": "#HEX", "400": "#HEX", "500": "#HEX", "600": "#HEX", "700": "#HEX", "800": "#HEX", "900": "#HEX" },
+    "success": { "50": "#HEX", "100": "#HEX", "200": "#HEX", "300": "#HEX", "400": "#HEX", "500": "#HEX", "600": "#HEX", "700": "#HEX", "800": "#HEX", "900": "#HEX" },
+    "warning": { "50": "#HEX", "100": "#HEX", "200": "#HEX", "300": "#HEX", "400": "#HEX", "500": "#HEX", "600": "#HEX", "700": "#HEX", "800": "#HEX", "900": "#HEX" },
+    "error":   { "50": "#HEX", "100": "#HEX", "200": "#HEX", "300": "#HEX", "400": "#HEX", "500": "#HEX", "600": "#HEX", "700": "#HEX", "800": "#HEX", "900": "#HEX" },
+    "info":    { "50": "#HEX", "100": "#HEX", "200": "#HEX", "300": "#HEX", "400": "#HEX", "500": "#HEX", "600": "#HEX", "700": "#HEX", "800": "#HEX", "900": "#HEX" }
+  },
+  "spacing": { "xs": "4px", "sm": "8px", "md": "16px", "lg": "24px", "xl": "32px", "2xl": "48px", "3xl": "64px" },
+  "radii":   { "none": "0px", "sm": "4px", "md": "8px", "lg": "12px", "xl": "16px", "2xl": "24px", "full": "9999px" },
+  "fonts":   { "heading": "Inter|Roboto|Poppins|Montserrat|Open Sans", "body": "Inter|Roboto|Poppins|Montserrat|Open Sans", "mono": "JetBrains Mono|Fira Code|Source Code Pro", "display": "Playfair Display|Merriweather|Lora" },
+  "fontSizes": { "xs":"12px","sm":"14px","md":"16px","lg":"18px","xl":"20px","2xl":"24px","3xl":"30px","4xl":"36px","5xl":"48px","6xl":"60px" },
+  "fontWeights": { "hairline":"100","thin":"200","light":"300","normal":"400","medium":"500","semibold":"600","bold":"700","extrabold":"800","black":"900" },
+  "lineHeights": { "none":"1","tight":"1.25","snug":"1.375","normal":"1.5","relaxed":"1.625","loose":"2" },
+  "shadows": {
+    "xs":"0 1px 2px rgba(0,0,0,0.06)",
+    "sm":"0 1px 3px rgba(0,0,0,0.1)",
+    "md":"0 4px 8px rgba(0,0,0,0.12)",
+    "lg":"0 8px 20px rgba(0,0,0,0.14)",
+    "xl":"0 16px 28px rgba(0,0,0,0.15)",
+    "2xl":"0 24px 48px rgba(0,0,0,0.18)",
+    "inner":"inset 0 2px 6px rgba(0,0,0,0.08)",
+    "outline":"0 0 0 3px rgba(66,153,225,0.4)"
+  },
+  "borders": {
+    "widths": { "none":"0px","thin":"1px","thick":"3px" },
+    "styles": { "solid":"solid","dashed":"dashed","dotted":"dotted","double":"double","groove":"groove","ridge":"ridge","inset":"inset","outset":"outset" }
+  },
+  "gradients": {
+    "primary": "linear-gradient(45deg, #HEX, #HEX)",
+    "secondary": "linear-gradient(45deg, #HEX, #HEX)",
+    "accent": "linear-gradient(45deg, #HEX, #HEX)",
+    "neutral": "linear-gradient(45deg, #HEX, #HEX)"
+  },
+  "backgrounds": {
+    "primary": "rgba(R,G,B,0.95)",
+    "secondary": "rgba(R,G,B,0.95)",
+    "tertiary": "rgba(R,G,B,0.9)",
+    "overlay": "rgba(R,G,B,0.5)"
+  },
+  "animations": {
+    "duration": { "fast":"150ms","normal":"300ms","slow":"500ms" },
+    "easing": { "linear":"linear","ease":"ease","easeIn":"ease-in","easeOut":"ease-out","easeInOut":"ease-in-out" }
+  },
+  "breakpoints": { "sm":"640px","md":"768px","lg":"1024px","xl":"1280px","2xl":"1536px" }
 }
 
+Requirements:
+- Theme: "${description}" — create a cohesive, original system that fits.
+- Use VALID CSS values and hex colors.
+- Keep values realistic and consistent.
+- Output JSON ONLY (no markdown, no code fences, no commentary).
+`.trim();
+  }
 
+  // ======================================================
+  // ============== JSON Patch guards & coercion ==========
+  // ======================================================
 
+  private validateAndCoercePatch(aiOps: unknown, allowedPaths: string[], contextDoc: any): Operation[] {
+    if (!Array.isArray(aiOps)) {
+      throw new BadRequestException('Patch must be an array');
+    }
 
+    // Shallow shape checks + allow-list enforcement
+    const coerced: Operation[] = aiOps.map((raw, idx) => {
+      const op = (raw as any)?.op;
+      const path = (raw as any)?.path;
 
+      if (op !== 'add' && op !== 'remove' && op !== 'replace') {
+        throw new BadRequestException(`Invalid op at index ${idx}: ${String(op)}`);
+      }
+      if (typeof path !== 'string' || !path.startsWith('/')) {
+        throw new BadRequestException(`Invalid path at index ${idx}: ${String(path)}`);
+      }
+      const withinAllowed = allowedPaths.some(p => path === p || path.startsWith(p + '/'));
+      if (!withinAllowed) {
+        throw new BadRequestException(`Forbidden path at index ${idx}: ${path}`);
+      }
+
+      if (op === 'remove') {
+        return { op: 'remove', path } as Operation;
+      }
+
+      if (!('value' in (raw as any))) {
+        throw new BadRequestException(`Missing "value" for non-remove op at index ${idx} (${path})`);
+      }
+
+      const value = (raw as any).value;
+      if (op === 'add') {
+        return { op: 'add', path, value } as Operation;
+      }
+      return { op: 'replace', path, value } as Operation;
+    });
+
+    // Optional semantic validation using fast-json-patch
+    const error = jsonpatch.validate(coerced as any, contextDoc);
+    if (error) {
+      // jsonpatch.validate returns an Error-like object; surface a readable message
+      throw new BadRequestException(`Invalid JSON Patch: ${error.message || String(error)}`);
+    }
+
+    return coerced;
+  }
+}

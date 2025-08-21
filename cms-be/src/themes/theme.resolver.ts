@@ -1,9 +1,10 @@
 import { Args, Mutation, Query, Resolver } from '@nestjs/graphql';
 import { Theme } from './theme.entity';
-import { ThemeService } from './theme.service';
+
 import { UpdateThemeInput } from './dto/update-theme.input';
 import { GenerateThemeInput } from './dto/generate-theme.input';
 import { AmendThemeInput } from './dto/amend-theme.input';
+import { ThemeService } from './theme.service';
 
 @Resolver(() => Theme)
 export class ThemeResolver {
@@ -17,6 +18,17 @@ export class ThemeResolver {
   @Query(() => [Theme])
   themes() {
     return this.service.getAll();
+  }
+
+  @Query(() => String)
+  async checkOpenAIHealth() {
+    console.log('🏥 [RESOLVER] Health check requested');
+    const result = await this.service.checkOpenAIConnection();
+    if (result.success) {
+      return `OpenAI connection healthy - ${result.duration}ms, ${result.modelCount} models available`;
+    } else {
+      return `OpenAI connection failed: ${result.error}`;
+    }
   }
 
   @Mutation(() => Theme)

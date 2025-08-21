@@ -37,6 +37,7 @@ type Mutation {
 }
 
 type Query {
+  checkOpenAIHealth: String!
   lesson(slug: String!): Lesson!
   theme(id: String!): Theme!
   themes: [Theme!]!
