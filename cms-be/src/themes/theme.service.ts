@@ -4,13 +4,17 @@ import { Repository } from 'typeorm';
 import { Theme } from './theme.entity';
 import { UpdateThemeInput } from './dto/update-theme.input';
 import { GenerateThemeInput } from './dto/generate-theme.input';
+import { AmendThemeInput } from './dto/amend-theme.input';
 import { ThemeTokensSchema } from '../common/zod/schemas';
 import { AuditService } from '../audit/audit.service';
+import { jsonPatchSchema } from '../common/jsonPatchSchema';
 import OpenAI from 'openai';
+import * as jsonpatch from 'fast-json-patch';
 
 @Injectable()
 export class ThemeService {
   private openai: OpenAI;
+  private amendmentCache = new Map<string, { tokens: any; diff: any; timestamp: number }>();
 
   constructor(
     @InjectRepository(Theme) private readonly repo: Repository<Theme>,
@@ -305,7 +309,7 @@ IMPORTANT:
       if (/^gpt-5/.test(model)) {
         params.max_completion_tokens = 40000;
       } else {
-        params.max_tokens = 40000;
+        params.max_completion_tokens = 40000;
       }
   
       let completion;
@@ -362,11 +366,495 @@ IMPORTANT:
     
     return `Theme "${theme.name || id}" deleted successfully`;
   }
+
+  // Theme amendment methods
+  private resolveScopeToPaths(scope: NonNullable<AmendThemeInput['scope']>): string[] {
+    console.log('🗺️ [PATH RESOLUTION] Resolving scope to paths:', scope);
+    
+    const out: string[] = [];
+    for (const s of scope) {
+      if (s === 'notifications') {
+        out.push('/colors/success', '/colors/warning', '/colors/error', '/colors/info');
+        console.log('🗺️ [PATH RESOLUTION] Mapped notifications to:', ['/colors/success', '/colors/warning', '/colors/error', '/colors/info']);
+      }
+      else if (s === 'spacing') {
+        out.push('/spacing');
+        console.log('🗺️ [PATH RESOLUTION] Mapped spacing to:', ['/spacing']);
+      }
+      else if (s === 'radii') {
+        out.push('/radii');
+        console.log('🗺️ [PATH RESOLUTION] Mapped radii to:', ['/radii']);
+      }
+      else if (s === 'brandColors') {
+        out.push('/colors');
+        console.log('🗺️ [PATH RESOLUTION] Mapped brandColors to:', ['/colors']);
+      }
+      else if (s === 'accentColors') {
+        out.push('/colors');
+        console.log('🗺️ [PATH RESOLUTION] Mapped accentColors to:', ['/colors']);
+      }
+      else if (s === 'typography') {
+        out.push('/fonts', '/fontSizes', '/fontWeights', '/lineHeights');
+        console.log('🗺️ [PATH RESOLUTION] Mapped typography to:', ['/fonts', '/fontSizes', '/fontWeights', '/lineHeights']);
+      }
+      else if (s === 'layout') {
+        out.push('/breakpoints', '/grid', '/flexbox');
+        console.log('🗺️ [PATH RESOLUTION] Mapped layout to:', ['/breakpoints', '/grid', '/flexbox']);
+      }
+      else if (s === 'shadows') {
+        out.push('/shadows');
+        console.log('🗺️ [PATH RESOLUTION] Mapped shadows to:', ['/shadows']);
+      }
+      else if (s === 'borders') {
+        out.push('/borders');
+        console.log('🗺️ [PATH RESOLUTION] Mapped borders to:', ['/borders']);
+      }
+      else if (s === 'animations') {
+        out.push('/animations');
+        console.log('🗺️ [PATH RESOLUTION] Mapped animations to:', ['/animations']);
+      }
+    }
+    
+    console.log('🗺️ [PATH RESOLUTION] Final resolved paths:', out);
+    return out;
+  }
+
+  private pickSubtree(tokens: any, prefixes: string[]) {
+    console.log('🌳 [SUBTREE PICKING] Picking subtree with prefixes:', prefixes);
+    
+    const out: any = {};
+    for (const p of prefixes) {
+      const parts = p.split('/').filter(Boolean);
+      console.log('🌳 [SUBTREE PICKING] Processing path:', p, '→ parts:', parts);
+      
+      let src = tokens;
+      let ok = true;
+      for (const k of parts) {
+        if (src && Object.prototype.hasOwnProperty.call(src, k)) {
+          src = src[k];
+          console.log('🌳 [SUBTREE PICKING] Found key:', k, '→ value:', src);
+        } else {
+          console.warn('🌳 [SUBTREE PICKING] Missing key:', k, 'in path:', p);
+          ok = false;
+          break;
+        }
+      }
+      
+      if (!ok) {
+        console.warn('🌳 [SUBTREE PICKING] Skipping invalid path:', p);
+        continue;
+      }
+      
+      let cur = out;
+      parts.forEach((k, i) => {
+        if (i === parts.length - 1) {
+          cur[k] = src;
+          console.log('🌳 [SUBTREE PICKING] Set final value for:', k, '→', src);
+        } else {
+          cur[k] ??= {};
+          cur = cur[k];
+        }
+      });
+    }
+    
+    console.log('🌳 [SUBTREE PICKING] Final subtree extracted:', out);
+    return out;
+  }
+
+  private applySubtree(tokens: any, prefixes: string[], subtree: any) {
+    console.log('🔀 [APPLY SUBTREE] Starting applySubtree...');
+    console.log('🔀 [APPLY SUBTREE] Prefixes to apply:', prefixes);
+    console.log('🔀 [APPLY SUBTREE] Subtree to apply:', subtree);
+    
+    const next = JSON.parse(JSON.stringify(tokens));
+    console.log('🔀 [APPLY SUBTREE] Deep cloned tokens for modification');
+    
+    for (const p of prefixes) {
+      const parts = p.split('/').filter(Boolean);
+      console.log('🔀 [APPLY SUBTREE] Processing path:', p, '→ parts:', parts);
+      
+      let dst = next;
+      let src = subtree;
+      
+      for (let i = 0; i < parts.length; i++) {
+        const k = parts[i];
+        if (i === parts.length - 1) {
+          if (src && src[k] !== undefined) {
+            console.log('🔀 [APPLY SUBTREE] Setting final value for:', k, '→', src[k]);
+            dst[k] = src[k];
+          } else {
+            console.warn('🔀 [APPLY SUBTREE] No value to set for:', k, 'in path:', p);
+          }
+        } else {
+          dst[k] ??= {};
+          dst = dst[k];
+          src = src?.[k];
+          console.log('🔀 [APPLY SUBTREE] Navigating to:', k, 'src exists:', !!src);
+        }
+      }
+    }
+    
+    console.log('🔀 [APPLY SUBTREE] Subtree application completed');
+    return next;
+  }
+
+  private async detectSectionsFromInstruction(instruction: string): Promise<Array<'notifications' | 'spacing' | 'radii' | 'brandColors' | 'accentColors' | 'typography' | 'layout' | 'shadows' | 'borders' | 'animations'>> {
+    console.log('🔍 [SECTION DETECTION] Starting section detection for instruction:', instruction);
+    
+    try {
+      console.log('🔍 [SECTION DETECTION] Making GPT-5-nano call for section detection...');
+      
+      const res = await this.openai.chat.completions.create({
+        model: 'gpt-5-nano',
+        messages: [
+          {
+            role: 'system',
+            content: `You are a theme section detector. Given a user instruction, determine which theme sections are being modified.
+
+Available sections:
+- colors (for any color-related changes)
+- spacing (for spacing, margins, padding changes)
+- radii (for border radius changes)
+- typography (for font, text changes)
+- shadows (for shadow, elevation changes)
+- borders (for border changes)
+- animations (for animation, transition changes)
+
+Respond with ONLY a comma-separated list of section names, no other text. Example: "colors,spacing" or just "colors" if only one section.`
+          },
+                    {
+            role: 'user',
+            content: instruction
+          }
+        ],
+        temperature: 1,
+        max_completion_tokens: 50000,
+        response_format: { type: 'text' }
+      });
+
+      const content = res.choices[0]?.message?.content?.trim();
+      console.log('🔍 [SECTION DETECTION] Raw AI response:', content);
+      console.log('🔍 [SECTION DETECTION] Usage - Prompt tokens:', res.usage?.prompt_tokens, 'Completion tokens:', res.usage?.completion_tokens, 'Total tokens:', res.usage?.total_tokens);
+      
+      if (!content) {
+        console.warn('🔍 [SECTION DETECTION] Empty AI response');
+        return ['brandColors', 'accentColors']; // fallback to colors
+      }
+
+      // Parse comma-separated response
+      const sections = content.split(',').map(s => s.trim().toLowerCase());
+      console.log('🔍 [SECTION DETECTION] Parsed sections:', sections);
+      console.log('🔍 [SECTION DETECTION] Raw AI response (lowercase):', content.toLowerCase());
+      
+      // Map to valid section names - simplified to use 'colors' for all color-related changes
+      const validSections: Array<'notifications' | 'spacing' | 'radii' | 'brandColors' | 'accentColors' | 'typography' | 'layout' | 'shadows' | 'borders' | 'animations'> = [];
+      
+      for (const section of sections) {
+        if (section === 'colors' || section === 'color' || section === 'accentcolors') {
+          validSections.push('brandColors', 'accentColors');
+        } else if (section === 'spacing') {
+          validSections.push('spacing');
+        } else if (section === 'radii' || section === 'radius') {
+          validSections.push('radii');
+        } else if (section === 'typography' || section === 'font' || section === 'text') {
+          validSections.push('typography');
+        } else if (section === 'shadows' || section === 'shadow') {
+          validSections.push('shadows');
+        } else if (section === 'borders' || section === 'border') {
+          validSections.push('borders');
+        } else if (section === 'animations' || section === 'animation') {
+          validSections.push('animations');
+        }
+      }
+
+      console.log('🔍 [SECTION DETECTION] Final valid sections:', validSections);
+      
+      if (validSections.length === 0) {
+        console.warn('🔍 [SECTION DETECTION] No valid sections found, using fallback');
+        return ['brandColors', 'accentColors'];
+      }
+
+      return validSections;
+    } catch (error) {
+      console.error('🔍 [SECTION DETECTION] Section detection failed:', error);
+      console.warn('🔍 [SECTION DETECTION] Falling back to default: colors');
+      return ['brandColors', 'accentColors'];
+    }
+  }
+
+
+
+  private async regenSubtree(tokens: any, instruction: string, scope?: AmendThemeInput['scope']) {
+    console.log('🔄 [REGEN] Starting regenSubtree...');
+    console.log('🔄 [REGEN] Instruction:', instruction);
+    console.log('🔄 [REGEN] Manual scope:', scope);
+    
+    const allow = this.resolveScopeToPaths(scope ?? ['notifications' as const]);
+    console.log('🔄 [REGEN] Resolved allowed paths:', allow);
+    
+    const ctx = this.pickSubtree(tokens, allow);
+    console.log('🔄 [REGEN] Context subtree extracted, size:', JSON.stringify(ctx).length, 'chars');
+    
+    console.log('🔄 [REGEN] Making AI call for subtree regeneration...');
+    const res = await this.openai.chat.completions.create({
+      model: 'gpt-5-nano',
+      messages: [
+        { role: 'system', content: 'Return ONLY valid JSON of the same keys; no prose.' },
+        { role: 'user', content: `Instruction: ${instruction}\nCurrent subtree:\n${JSON.stringify(ctx)}` }
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 1,
+      max_completion_tokens: 50000
+    });
+    
+    const content = res.choices[0]?.message?.content?.trim();
+    console.log('🔄 [REGEN] Raw AI response:', content);
+    console.log('🔄 [REGEN] Usage - Prompt tokens:', res.usage?.prompt_tokens, 'Completion tokens:', res.usage?.completion_tokens, 'Total tokens:', res.usage?.total_tokens);
+    
+    if (!content) {
+      console.error('🔄 [REGEN] Empty AI response');
+      throw new Error('Empty AI response');
+    }
+    
+    const patchSubtree = JSON.parse(content);
+    console.log('🔄 [REGEN] Parsed regenerated subtree');
+    
+    console.log('🔄 [REGEN] Applying regenerated subtree...');
+    const result = this.applySubtree(tokens, allow, patchSubtree);
+    console.log('🔄 [REGEN] Subtree applied successfully');
+    
+    return result;
+  }
+
+  private async patchWithAI(tokens: any, instruction: string, scope?: AmendThemeInput['scope']) {
+    console.log('🔧 [PATCH AI] Starting patchWithAI...');
+    console.log('🔧 [PATCH AI] Instruction:', instruction);
+    console.log('🔧 [PATCH AI] Manual scope:', scope);
+    
+    let allow: string[];
+    if (scope) {
+      console.log('🔧 [PATCH AI] Using manual scope');
+      allow = this.resolveScopeToPaths(scope);
+    } else {
+      console.log('🔧 [PATCH AI] Auto-detecting sections...');
+      const detectedSections = await this.detectSectionsFromInstruction(instruction);
+      allow = this.resolveScopeToPaths(detectedSections);
+    }
+    
+    console.log('🔧 [PATCH AI] Resolved allowed paths:', allow);
+    
+    const ctx = this.pickSubtree(tokens, allow);
+    console.log('🔧 [PATCH AI] Context subtree extracted, size:', JSON.stringify(ctx).length, 'chars');
+    
+    console.log('🔧 [PATCH AI] Making AI call for JSON patch generation...');
+    console.log('🔧 [PATCH AI] Full instruction being sent to AI:', instruction);
+    
+    // Analyze the instruction to identify multiple values
+    const instructionLower = instruction.toLowerCase();
+    const hasMultipleValues = /and|&|,|plus|\+/.test(instructionLower);
+    const hasXlAnd2xl = /xl.*2xl|2xl.*xl/.test(instructionLower);
+    
+    console.log('🔧 [PATCH AI] Instruction analysis - hasMultipleValues:', hasMultipleValues, 'hasXlAnd2xl:', hasXlAnd2xl);
+    
+    let enhancedPrompt = `Instruction: ${instruction}\n\n`;
+    
+    if (hasMultipleValues) {
+      enhancedPrompt += `🚨 CRITICAL: This instruction mentions MULTIPLE values that need updating!\n`;
+      enhancedPrompt += `You MUST create a separate patch operation for EACH mentioned value.\n`;
+      enhancedPrompt += `Do NOT update just one value - update ALL mentioned values.\n\n`;
+    }
+    
+    if (hasXlAnd2xl) {
+      enhancedPrompt += `🎯 SPECIFIC: This mentions "xl and 2xl" - you MUST update BOTH:\n`;
+      enhancedPrompt += `- Update /fontSizes/xl to a slightly larger value\n`;
+      enhancedPrompt += `- Update /fontSizes/2xl to a slightly larger value\n`;
+      enhancedPrompt += `Create TWO separate patch operations.\n\n`;
+    }
+    
+    enhancedPrompt += `IMPORTANT: If this instruction involves updating colors, you MUST update the ENTIRE color palette (all 10 shades: 50, 100, 200, 300, 400, 500, 600, 700, 800, 900). Do not update just one or two colors.\n\n`;
+    enhancedPrompt += `Allowed prefixes: ${JSON.stringify(allow)}\nContext:\n${JSON.stringify(ctx)}`;
+    
+    console.log('🔧 [PATCH AI] Enhanced user prompt being sent to AI:', enhancedPrompt);
+    
+    const res = await this.openai.chat.completions.create({
+        model: 'gpt-5-nano',
+        messages: [
+          { 
+            role: 'system', 
+            content: 'You are a JSON Patch expert. Return ONLY a valid RFC6902 JSON Patch array. Each operation must have: op (replace/add/remove), path (JSON pointer), and value (except for remove operations). IMPORTANT: Use the exact paths from the allowed prefixes. If you see "/colors" as allowed, use paths like "/colors/brand", "/colors/accent", "/colors/success", etc. CRITICAL: When updating color palettes, you MUST update ALL color values in that palette (50, 100, 200, 300, 400, 500, 600, 700, 800, 900). Do NOT update just one color - update the entire palette. CRITICAL: When updating multiple specific values (like "xl and 2xl font sizes"), you MUST update ALL mentioned values, not just one. Examples: To update accent colors to green: [{"op":"replace","path":"/colors/accent","value":{"50":"#e6f7e6","100":"#ccefcc","200":"#b3e7b3","300":"#99df99","400":"#80d780","500":"#66cf66","600":"#4dc74d","700":"#33bf33","800":"#1ab71a","900":"#00af00"}}]. To update neutral colors to grays: [{"op":"replace","path":"/colors/neutral","value":{"50":"#fafafa","100":"#f5f5f5","200":"#eeeeee","300":"#e0e0e0","400":"#bdbdbd","500":"#9e9e9e","600":"#757575","700":"#616161","800":"#424242","900":"#212121"}}]. To update xl and 2xl font sizes: [{"op":"replace","path":"/fontSizes/xl","value":"22px"},{"op":"replace","path":"/fontSizes/2xl","value":"26px"}]' 
+          },
+          { role: 'user', content: enhancedPrompt }
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 1,
+        max_completion_tokens: 50000
+      });
+    
+    const raw = res.choices[0]?.message?.content?.trim();
+    console.log('🔧 [PATCH AI] Raw AI response:', raw);
+    console.log('🔧 [PATCH AI] Usage - Prompt tokens:', res.usage?.prompt_tokens, 'Completion tokens:', res.usage?.completion_tokens, 'Total tokens:', res.usage?.total_tokens);
+    
+    if (!raw) {
+      console.error('🔧 [PATCH AI] Empty AI response');
+      throw new Error('Empty AI response');
+    }
+    
+    let patch;
+    try {
+      const parsed = JSON.parse(raw);
+      // The AI might return the patch directly as an array, or wrapped in an object, or as a single operation
+      if (Array.isArray(parsed)) {
+        patch = parsed;
+      } else if (parsed.patch && Array.isArray(parsed.patch)) {
+        patch = parsed.patch;
+      } else if (parsed.operations && Array.isArray(parsed.operations)) {
+        patch = parsed.operations;
+      } else if (parsed.op && parsed.path) {
+        // Single patch operation
+        patch = [parsed];
+      } else {
+        console.error('🔧 [PATCH AI] Invalid response format - expected array, object with patch/operations, or single operation');
+        throw new Error('Invalid response format - expected JSON Patch array or single operation');
+      }
+    } catch (parseError) {
+      console.error('🔧 [PATCH AI] Failed to parse AI response as JSON:', parseError);
+      throw new Error('Invalid JSON response from AI');
+    }
+    
+    console.log('🔧 [PATCH AI] Parsed patch, operations:', patch.length);
+    
+    console.log('🔧 [PATCH AI] Validating patch operations...');
+    for (const op of patch) {
+      // Validate operation structure
+      if (!op.op || !op.path) {
+        console.error('🔧 [PATCH AI] Invalid operation - missing op or path:', op);
+        throw new Error('Invalid operation - missing op or path');
+      }
+      
+      if (!['replace', 'add', 'remove'].includes(op.op)) {
+        console.error('🔧 [PATCH AI] Invalid operation type:', op.op);
+        throw new Error(`Invalid operation type: ${op.op}`);
+      }
+      
+      if (op.op !== 'remove' && op.value === undefined) {
+        console.error('🔧 [PATCH AI] Missing value for non-remove operation:', op);
+        throw new Error('Missing value for non-remove operation');
+      }
+      
+      // Validate path format (basic JSON pointer validation)
+      if (!op.path.startsWith('/')) {
+        console.error('🔧 [PATCH AI] Invalid path format - must start with /:', op.path);
+        throw new Error('Invalid path format - must start with /');
+      }
+      
+      // Validate path is allowed
+      const isAllowed = allow.some(p => op.path === p || op.path.startsWith(p + '/'));
+      console.log('🔧 [PATCH AI] Operation:', op.op, 'Path:', op.path, 'Allowed:', isAllowed);
+      
+      if (!isAllowed) {
+        console.error('🔧 [PATCH AI] Forbidden path detected:', op.path);
+        throw new Error(`Forbidden path: ${op.path}`);
+      }
+    }
+    
+    console.log('🔧 [PATCH AI] All paths validated, applying patch...');
+    const result = jsonpatch.applyPatch(JSON.parse(JSON.stringify(tokens)), patch, true).newDocument;
+    console.log('🔧 [PATCH AI] Patch applied successfully');
+    
+    return result;
+  }
+
+  private cleanupCache() {
+    const now = Date.now();
+    const oneHour = 60 * 60 * 1000; // 1 hour in milliseconds
+    
+    for (const [key, value] of this.amendmentCache.entries()) {
+      if (now - value.timestamp > oneHour) {
+        this.amendmentCache.delete(key);
+        console.log('🗑️ [CACHE] Cleaned up old cache entry:', key);
+      }
+    }
+  }
+
+  async amend(input: AmendThemeInput) {
+    console.log('🎯 [AMEND] Starting theme amendment for ID:', input.id);
+    console.log('🎯 [AMEND] Instruction:', input.instruction);
+    console.log('🎯 [AMEND] Manual scope:', input.scope);
+    console.log('🎯 [AMEND] Manual mode:', input.mode);
+    console.log('🎯 [AMEND] Dry run:', input.dryRun);
+    
+    const theme = await this.get(input.id);
+    console.log('🎯 [AMEND] Theme loaded:', theme.id, theme.name);
+    console.log('🎯 [AMEND] Available theme paths:', Object.keys(theme.tokens));
+    console.log('🎯 [AMEND] Theme tokens sample:', JSON.stringify(theme.tokens, null, 2).substring(0, 500) + '...');
+    
+    // Check if we have cached changes for this theme and instruction
+    const cacheKey = `${input.id}:${input.instruction}`;
+    const cached = this.amendmentCache.get(cacheKey);
+    
+    let next = theme.tokens;
+    let diff: any;
+    
+    if (cached && !input.dryRun) {
+      // Use cached changes when applying (not previewing)
+      console.log('🎯 [AMEND] Using cached changes from preview');
+      next = cached.tokens;
+      diff = cached.diff;
+    } else {
+      // Generate new changes (either for preview or when no cache exists)
+      console.log('🎯 [AMEND] Generating new changes...');
+      
+      // Simple strategy: use regen for scoped requests, patch for general ones
+      const strategy = input.mode ?? (input.scope && input.scope.length > 0 ? 'regen' : 'patch');
+      console.log('🎯 [AMEND] Selected strategy:', strategy);
+
+      try {
+        if (strategy === 'regen') {
+          console.log('🎯 [AMEND] Using regeneration strategy');
+          next = await this.regenSubtree(theme.tokens, input.instruction, input.scope);
+        } else {
+          console.log('🎯 [AMEND] Using patch strategy');
+          next = await this.patchWithAI(theme.tokens, input.instruction, input.scope);
+        }
+      } catch (error) {
+        console.error('🎯 [AMEND] Error during theme modification:', error);
+        throw new Error(`Theme modification failed: ${error.message}`);
+      }
+      
+      // Generate diff for new changes
+      diff = jsonpatch.compare(theme.tokens, next);
+      console.log('🎯 [AMEND] Diff generated, operations:', diff.length);
+      
+      // Cache the changes for future use
+      this.amendmentCache.set(cacheKey, { tokens: next, diff, timestamp: Date.now() });
+      console.log('🎯 [AMEND] Changes cached for future use');
+      
+      // Clean up old cache entries (older than 1 hour)
+      this.cleanupCache();
+    }
+
+    console.log('🎯 [AMEND] Tokens modified, validating with Zod...');
+    const validated = ThemeTokensSchema.parse(next);
+    console.log('🎯 [AMEND] Zod validation passed');
+
+    if (input.dryRun) {
+      console.log('🎯 [AMEND] Dry run mode - logging preview and returning');
+      await this.audit.log('theme.amend.preview', { id: input.id, diff });
+      return { ...theme, tokens: validated, _preview: true, diff };
+    }
+    
+    console.log('🎯 [AMEND] Saving theme to database...');
+    const saved = await this.repo.save({ ...theme, tokens: validated });
+    console.log('🎯 [AMEND] Theme saved successfully');
+    
+    await this.audit.log('theme.amend', { id: input.id, diff });
+    console.log('🎯 [AMEND] Amendment completed successfully');
+    
+    return saved;
+  }
 }
 
 
 
-
-/////////////////////////
 
 

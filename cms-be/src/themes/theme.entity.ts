@@ -24,4 +24,10 @@ export class Theme {
   @Field(() => GraphQLJSON)
   @Column({ type: 'jsonb' })
   tokens!: Record<string, any>;
+
+  @Field(() => Boolean, { nullable: true })
+  _preview?: boolean;
+
+  @Field(() => GraphQLJSON, { nullable: true })
+  diff?: any;
 }

@@ -2,6 +2,14 @@
 # THIS FILE WAS AUTOMATICALLY GENERATED (DO NOT MODIFY)
 # ------------------------------------------------------
 
+input AmendThemeInput {
+  dryRun: Boolean
+  id: String!
+  instruction: String!
+  mode: String
+  scope: [String!]
+}
+
 input GenerateThemeInput {
   description: String!
 }
@@ -21,6 +29,7 @@ type Lesson {
 }
 
 type Mutation {
+  amendTheme(input: AmendThemeInput!): Theme!
   deleteTheme(id: String!): String!
   generateTheme(input: GenerateThemeInput!): Theme!
   updateLesson(input: UpdateLessonInput!): Lesson!
@@ -34,7 +43,9 @@ type Query {
 }
 
 type Theme {
+  _preview: Boolean
   basedOnThemeId: String
+  diff: JSON
   id: ID!
   name: String
   notes: String
