@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # PostgreSQL Database
   postgres:
@@ -25,14 +23,11 @@ services:
     container_name: cms-backend
     ports:
       - "3000:3000"
+    env_file:
+      - ./.env.backend
     environment:
       NODE_ENV: development
       PORT: 3000
-      DATABASE_HOST: postgres
-      DATABASE_PORT: 5432
-      DATABASE_NAME: cms_dev
-      DATABASE_USERNAME: cms_user
-      DATABASE_PASSWORD: cms_password
     volumes:
       - ./cms-be:/app
       - /app/node_modules
