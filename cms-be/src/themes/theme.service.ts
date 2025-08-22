@@ -12,8 +12,9 @@ import * as jsonpatch from 'fast-json-patch';
 import type { Operation } from 'fast-json-patch';
 
 // Deterministic NL -> ops + patcher
-import { parseInstructions } from './instruction-parser';
+
 import { applyParsedOps } from './logic-patcher';
+import { parseInstructions } from './instruction-parser';
 
 type AIJsonPatchOp =
   | { op: 'replace'; path: string; value: any }
@@ -587,7 +588,9 @@ Given a description of a theme, create a cohesive design system and output ONLY 
     "success": { "50": "#HEX", "100": "#HEX", "200": "#HEX", "300": "#HEX", "400": "#HEX", "500": "#HEX", "600": "#HEX", "700": "#HEX", "800": "#HEX", "900": "#HEX" },
     "warning": { "50": "#HEX", "100": "#HEX", "200": "#HEX", "300": "#HEX", "400": "#HEX", "500": "#HEX", "600": "#HEX", "700": "#HEX", "800": "#HEX", "900": "#HEX" },
     "error":   { "50": "#HEX", "100": "#HEX", "200": "#HEX", "300": "#HEX", "400": "#HEX", "500": "#HEX", "600": "#HEX", "700": "#HEX", "800": "#HEX", "900": "#HEX" },
-    "info":    { "50": "#HEX", "100": "#HEX", "200": "#HEX", "300": "#HEX", "400": "#HEX", "500": "#HEX", "600": "#HEX", "700": "#HEX", "800": "#HEX", "900": "#HEX" }
+    "info":    { "50": "#HEX", "100": "#HEX", "200": "#HEX", "300": "#HEX", "400": "#HEX", "500": "#HEX", "600": "#HEX", "700": "#HEX", "800": "#HEX", "900": "#HEX" },
+    "black": "#000000",
+    "white": "#FFFFFF"
   },
   "spacing": { "xs": "4px", "sm": "8px", "md": "16px", "lg": "24px", "xl": "32px", "2xl": "48px", "3xl": "64px" },
   "radii":   { "none": "0px", "sm": "4px", "md": "8px", "lg": "12px", "xl": "16px", "2xl": "24px", "full": "9999px" },

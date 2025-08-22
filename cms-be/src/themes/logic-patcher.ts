@@ -6,7 +6,8 @@ import {
   SPACING_RANGES, RADII_RANGES, FONTSIZE_RANGES, LINEHEIGHT_RANGES, BREAKPOINT_KEYS,
   hexToRgbaString, ShadeKey, SHADE_KEYS
 } from './theme-utils';
-import { ParsedOp, TargetPalette } from './instruction-parser';
+import { TargetPalette, ParsedOp } from './instruction-parser';
+
 
 type Tokens = any;
 

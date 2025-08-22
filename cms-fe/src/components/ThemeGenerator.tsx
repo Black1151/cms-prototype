@@ -257,57 +257,84 @@ export default function ThemeGenerator() {
     return t.replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1");
   }
 
+  
+  // === NL helpers for conservative generate vs amend ===
+  function _norm(s: string) { return s.replace(/\s+/g, " ").trim(); }
+  function _lower(s: string) { return _norm(s).toLowerCase(); }
+  function _hasAny(hay: string, words: string[]) {
+    const s = _lower(hay);
+    return words.some(w => s.includes(w));
+  }
+
+  const GEN_EXPLICIT_VERBS = [
+    "create","generate","design","build","start","start over","start again","reset",
+    "spin up","spin-up","from scratch","brand new","brand-new","new theme","fresh theme",
+    "wipe","replace","scrap","throw away","discard","reset theme","start fresh"
+  ];
+  const THEME_NOUNS = ["theme","palette","scheme","color scheme","colour scheme","colorway","colourway","look","aesthetic","style","vibe"];
+  const REPLACE_WORDS = ["reset","start over","from scratch","replace","wipe","scrap","throw away","discard","fresh","brand new","brand-new","new theme","new palette","start fresh"];
+
+  function _explicitNewTheme(text: string) {
+    const s = _lower(text);
+    const mentionsTheme = _hasAny(s, THEME_NOUNS);
+    const mentionsReplace = _hasAny(s, REPLACE_WORDS);
+    // e.g. "create a new theme", "start over with a dark theme", "reset theme", "replace the current theme"
+    if (mentionsTheme && mentionsReplace) return true;
+    // very explicit imperative forms
+    if ((_hasAny(s, GEN_EXPLICIT_VERBS)) && mentionsTheme && /new|from scratch|start over|reset/.test(s)) return true;
+    return false;
+  }
+
   function parseIntent(text: string): Intent {
     const raw = text.trim();
 
-    // Slash commands
+    // Slash commands remain authoritative
     if (raw.startsWith("/")) {
       const [cmd, ...rest] = raw.slice(1).split(" ");
       const arg = rest.join(" ").trim();
 
       switch (cmd.toLowerCase()) {
-        case "help":
-          return { kind: "help" };
-        case "list":
-          return { kind: "list" };
-        case "load":
-          return { kind: "load", key: unquote(arg) || "last" };
-        case "delete":
-          return { kind: "delete", key: unquote(arg) || "" };
-        case "name":
-          return { kind: "name", name: unquote(arg) || "" };
+        case "help":   return { kind: "help" };
+        case "list":   return { kind: "list" };
+        case "load":   return { kind: "load", key: unquote(arg) || "last" };
+        case "delete": return { kind: "delete", key: unquote(arg) || "" };
+        case "name":   return { kind: "name", name: unquote(arg) || "" };
         case "mode": {
           const m = arg.toLowerCase() as AmendMode;
-          if (m === "auto" || m === "regen" || m === "patch") return { kind: "mode", mode: m };
-          return { kind: "mode", mode: "auto" };
+          return (m === "auto" || m === "regen" || m === "patch") ? { kind: "mode", mode: m } : { kind: "mode", mode: "auto" };
         }
-        case "json":
-          return { kind: "json", val: ["on", "true", "1", "yes"].includes(arg.toLowerCase()) };
+        case "json":   return { kind: "json", val: ["on","true","1","yes"].includes(arg.toLowerCase()) };
         case "save": {
           const name = unquote(arg);
           return { kind: "save", name: name || undefined };
         }
         case "gen":
         case "generate": {
-          // allow optional name syntax: generate "Name": description...
           const nameMatch = arg.match(/^"([^"]+)"\s*:\s*(.*)$/);
-          if (nameMatch) {
-            return { kind: "generate", name: nameMatch[1], description: nameMatch[2] || "" };
-          }
+          if (nameMatch) return { kind: "generate", name: nameMatch[1], description: nameMatch[2] || "" };
           return { kind: "generate", description: arg, name: undefined };
         }
-        case "preview":
-          return { kind: "preview", instruction: arg };
-        case "apply":
-          return { kind: "apply" };
-        default:
-          return { kind: "help" };
+        case "preview": return { kind: "preview", instruction: arg };
+        case "apply":   return { kind: "apply" };
+        default:        return { kind: "help" };
       }
     }
 
-    // Natural language defaults
-    return { kind: "amend-or-generate", text: raw };
+    // Natural language:
+    // SAFETY FIRST: If a theme is already loaded, prefer "amend" unless the user *explicitly* asks to start over.
+    if (generatedTheme) {
+      if (_explicitNewTheme(raw)) {
+        // Only in very explicit "start over / new theme / reset" cases do we regenerate.
+        return { kind: "generate", description: raw };
+      }
+      // Default with a loaded theme: treat as an amendment instruction.
+      return { kind: "amend-or-generate", text: raw };
+    }
+
+    // No theme loaded yet: natural language is a generation request.
+    return { kind: "generate", description: raw };
   }
+
 
   // === Command handlers ===
 
@@ -780,6 +807,43 @@ export default function ThemeGenerator() {
                     <SwatchGrid scale={generatedTheme.tokens.colors.neutral} columns={5} size="md" />
                   </Box>
                 )}
+
+                {/* Essential Colors - Black and White */}
+                <Box mt={6}>
+                  <SubTitle>Essential Colors</SubTitle>
+                  <SimpleGrid columns={2} spacing={4}>
+                    <VStack spacing={2}>
+                      <Box
+                        w="12"
+                        h="12"
+                        borderRadius="md"
+                        border="1px solid"
+                        borderColor="gray.300"
+                        bg={generatedTheme.tokens?.colors?.black || "#000000"}
+                        shadow="sm"
+                      />
+                      <Text fontSize="sm" fontWeight="medium">Black</Text>
+                      <Text fontSize="xs" color="gray.600" fontFamily="mono">
+                        {generatedTheme.tokens?.colors?.black || "#000000"}
+                      </Text>
+                    </VStack>
+                    <VStack spacing={2}>
+                      <Box
+                        w="12"
+                        h="12"
+                        borderRadius="md"
+                        border="1px solid"
+                        borderColor="gray.300"
+                        bg={generatedTheme.tokens?.colors?.white || "#FFFFFF"}
+                        shadow="sm"
+                      />
+                      <Text fontSize="sm" fontWeight="medium">White</Text>
+                      <Text fontSize="xs" color="gray.600" fontFamily="mono">
+                        {generatedTheme.tokens?.colors?.white || "#FFFFFF"}
+                      </Text>
+                    </VStack>
+                  </SimpleGrid>
+                </Box>
 
                 <SimpleGrid columns={{ base: 1, md: 3 }} spacing={4} mt={6}>
                   {generatedTheme.tokens?.colors?.success && (

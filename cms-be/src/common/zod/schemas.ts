@@ -14,6 +14,8 @@ export const ThemeTokensSchema = z.object({
     warning: Scale.optional(),
     error: Scale.optional(),
     info: Scale.optional(),
+    black: z.string(),
+    white: z.string(),
   }),
   spacing: z.object({
     xs: z.string().optional(),

@@ -5,7 +5,6 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { join } from 'path';
 import { ThemesModule } from './themes/theme.module';
 import { LessonsModule } from './lessons/lesson.module';
-import { SeedService } from './seed/seed.service';
 import { Theme } from './themes/theme.entity';
 import { Lesson } from './lessons/lesson.entity';
 
@@ -31,6 +30,6 @@ import { Lesson } from './lessons/lesson.entity';
     ThemesModule,
     LessonsModule,
   ],
-  providers: [SeedService],
+
 })
 export class AppModule {}

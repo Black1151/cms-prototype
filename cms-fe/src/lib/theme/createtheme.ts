@@ -19,6 +19,8 @@ export function createChakraThemeFromTokens(tokens: unknown) {
       warning: t.colors.warning ?? DEFAULT_THEME_FALLBACKS.colors.warning,
       error: t.colors.error ?? DEFAULT_THEME_FALLBACKS.colors.error,
       info: t.colors.info ?? DEFAULT_THEME_FALLBACKS.colors.info,
+      black: t.colors.black,
+      white: t.colors.white,
       // Override any default Chakra colors to prevent inheritance
       gray: t.colors.neutral ?? DEFAULT_THEME_FALLBACKS.colors.neutral,
       red: t.colors.error ?? DEFAULT_THEME_FALLBACKS.colors.error,

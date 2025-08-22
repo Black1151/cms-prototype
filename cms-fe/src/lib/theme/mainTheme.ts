@@ -76,6 +76,8 @@ export const mainTheme = extendTheme({
       800: '#991b1b',
       900: '#7f1d1d',
     },
+    black: '#000000',
+    white: '#FFFFFF',
   },
   fonts: {
     heading: 'Inter, system-ui, sans-serif',

@@ -95,6 +95,8 @@ export const DEFAULT_THEME_FALLBACKS = {
       800: '#1e40af',
       900: '#1e3a8a',
     },
+    black: '#000000',
+    white: '#FFFFFF',
   },
   fonts: {
     heading: 'Inter, system-ui, sans-serif',
